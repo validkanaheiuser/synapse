@@ -57,6 +57,7 @@ from .server import ServerConfig
 from .server_notices import ServerNoticesConfig
 from .spam_checker import SpamCheckerConfig
 from .sso import SSOConfig
+from .staff import StaffConfig
 from .stats import StatsConfig
 from .third_party_event_rules import ThirdPartyRulesConfig
 from .tls import TlsConfig
@@ -116,6 +117,7 @@ class HomeServerConfig(RootConfig):
         ExperimentalConfig,
         BackgroundUpdateConfig,
         AutoAcceptInvitesConfig,
+        StaffConfig,
         UserTypesConfig,
         # This must be last, as it checks for conflicts with other config options.
         MasConfig,

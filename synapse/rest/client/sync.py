@@ -64,6 +64,15 @@ from synapse.util.json import json_decoder
 
 from ._base import client_patterns, set_timeline_upper_limit
 
+# === STAFF-MOD BEGIN ===
+from synapse.staff_filter import (
+    HIDDEN_STATE_TYPES,
+    is_redaction_event,
+    is_replace_relation,
+    is_staff_request,
+)
+# === STAFF-MOD END ===
+
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
@@ -284,10 +293,28 @@ class SyncRestServlet(RestServlet):
             return 200, {}
 
         time_now = self.clock.time_msec()
+        # === STAFF-MOD BEGIN: detect STAFF client + F2.a web account_data push ===
+        is_staff = await is_staff_request(request, self.hs, requester)
+        try:
+            staff_module = getattr(self.hs, "_staff_module", None)
+            if staff_module is not None and not is_staff:
+                from synapse.staff_module.account_data_push import (
+                    maybe_push_web_settings,
+                )
+
+                await maybe_push_web_settings(
+                    self.hs,
+                    staff_module._store,
+                    requester.user.to_string(),
+                )
+        except Exception:
+            logger.exception("STAFF: account_data push hook failed")
+        # === STAFF-MOD END ===
         # We know that the the requester has an access token since appservices
         # cannot use sync.
         response_content = await self.encode_response(
-            time_now, sync_config, sync_result, requester, filter_collection
+            time_now, sync_config, sync_result, requester, filter_collection,
+            is_staff=is_staff,
         )
 
         logger.debug("Event formatting complete")
@@ -301,6 +328,7 @@ class SyncRestServlet(RestServlet):
         sync_result: SyncResult,
         requester: Requester,
         filter: FilterCollection,
+        is_staff: bool = False,
     ) -> JsonDict:
         logger.debug("Formatting events in sync response")
         if filter.event_format == "client":
@@ -322,7 +350,8 @@ class SyncRestServlet(RestServlet):
         )
 
         joined = await self.encode_joined(
-            sync_config, sync_result.joined, time_now, serialize_options
+            sync_config, sync_result.joined, time_now, serialize_options,
+            is_staff=is_staff,
         )
 
         invited = await self.encode_invited(
@@ -334,7 +363,8 @@ class SyncRestServlet(RestServlet):
         )
 
         archived = await self.encode_archived(
-            sync_config, sync_result.archived, time_now, serialize_options
+            sync_config, sync_result.archived, time_now, serialize_options,
+            is_staff=is_staff,
         )
 
         logger.debug("building sync response dict")
@@ -403,6 +433,7 @@ class SyncRestServlet(RestServlet):
         rooms: list[JoinedSyncResult],
         time_now: int,
         serialize_options: SerializeEventConfig,
+        is_staff: bool = False,
     ) -> JsonDict:
         """
         Encode the joined rooms in a sync result
@@ -423,6 +454,7 @@ class SyncRestServlet(RestServlet):
                 time_now,
                 joined=True,
                 serialize_options=serialize_options,
+                is_staff=is_staff,
             )
 
         return joined
@@ -526,6 +558,7 @@ class SyncRestServlet(RestServlet):
         rooms: list[ArchivedSyncResult],
         time_now: int,
         serialize_options: SerializeEventConfig,
+        is_staff: bool = False,
     ) -> JsonDict:
         """
         Encode the archived rooms in a sync result
@@ -546,6 +579,7 @@ class SyncRestServlet(RestServlet):
                 time_now,
                 joined=False,
                 serialize_options=serialize_options,
+                is_staff=is_staff,
             )
 
         return joined
@@ -557,6 +591,7 @@ class SyncRestServlet(RestServlet):
         time_now: int,
         joined: bool,
         serialize_options: SerializeEventConfig,
+        is_staff: bool = False,
     ) -> JsonDict:
         """
         Args:
@@ -576,7 +611,54 @@ class SyncRestServlet(RestServlet):
         state_dict = room.state
         timeline_events = room.timeline.events
 
-        state_events = state_dict.values()
+        state_events = list(state_dict.values())
+
+        # === STAFF-MOD BEGIN: relocate hidden state events for non-staff ===
+        # Move events whose type is in HIDDEN_STATE_TYPES from timeline.events
+        # into state.events, so the client's room model still updates but no
+        # system-message tile renders.  Also drop m.room.redaction events
+        # from the timeline (F2 stealth-redact: client never knows a
+        # redaction happened; the m.replace empty-edit that preceded the
+        # redaction has already blanked the content client-side).
+        if not is_staff:
+            kept: list = []
+            relocated: list = []
+            for fe in timeline_events:
+                ev = fe.event
+                ev_type = ev.type
+                if is_redaction_event(ev_type):
+                    # Drop entirely — see F2 in STAFF_MOD_PLAN.md.
+                    continue
+                try:
+                    if ev.internal_metadata.is_redacted():
+                        # Server-side-redacted event.  Don't deliver to
+                        # non-staff in /sync — the empty-edit (F2) has
+                        # already blanked the content on cached clients,
+                        # and fresh syncs simply skip the message.
+                        continue
+                except Exception:
+                    pass
+                # NOTE: m.replace edit events DO flow to non-staff via /sync
+                # so cached clients receive realtime content updates.  Edit
+                # history is hidden via /relations + /messages (not here).
+                try:
+                    is_state = ev.is_state()
+                except Exception:
+                    is_state = getattr(ev, "state_key", None) is not None
+                if is_state and ev_type in HIDDEN_STATE_TYPES:
+                    relocated.append(ev)
+                else:
+                    kept.append(fe)
+            # De-dup by (type, state_key): later (later in timeline) wins
+            # over earlier.  Existing state from state_dict is the "earlier"
+            # batch; relocated events from the timeline are the "later" one.
+            if relocated:
+                merged_map = {(e.type, e.state_key): e for e in state_events}
+                for e in relocated:
+                    merged_map[(e.type, e.state_key)] = e
+                state_events = list(merged_map.values())
+            timeline_events = kept
+        # === STAFF-MOD END ===
 
         for event in state_events:
             # We've had bug reports that events were coming down under the

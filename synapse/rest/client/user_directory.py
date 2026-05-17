@@ -31,6 +31,10 @@ from synapse.types import JsonMapping
 
 from ._base import client_patterns
 
+# === STAFF-MOD BEGIN ===
+from synapse.staff_filter import is_staff_request
+# === STAFF-MOD END ===
+
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
@@ -87,6 +91,46 @@ class UserDirectorySearchRestServlet(RestServlet):
             search_term = body["search_term"]
         except Exception:
             raise SynapseError(400, "`search_term` is required field")
+
+        # === STAFF-MOD BEGIN: F6 exact-MXID-only for non-staff ===
+        is_staff = await is_staff_request(request, self.hs, requester)
+        if not is_staff:
+            # Non-staff: only return a result if the search term is a
+            # complete MXID (starts with @, contains a colon).  Anything
+            # else returns an empty list — including partial fragments
+            # like "asdb" or "@asdb".
+            if (
+                isinstance(search_term, str)
+                and search_term.startswith("@")
+                and ":" in search_term
+            ):
+                try:
+                    info = await self.hs.get_datastores().main.get_userinfo_by_id(
+                        search_term
+                    )
+                except Exception:
+                    info = None
+                if info is None or getattr(info, "is_deactivated", False):
+                    return 200, {"limited": False, "results": []}
+                try:
+                    profile = (
+                        await self.hs.get_profile_handler()
+                        .get_profile(search_term)
+                    )
+                except Exception:
+                    profile = {}
+                return 200, {
+                    "limited": False,
+                    "results": [
+                        {
+                            "user_id": search_term,
+                            "display_name": (profile or {}).get("displayname"),
+                            "avatar_url": (profile or {}).get("avatar_url"),
+                        }
+                    ],
+                }
+            return 200, {"limited": False, "results": []}
+        # === STAFF-MOD END ===
 
         results = await self.user_directory_handler.search_users(
             user_id, search_term, limit

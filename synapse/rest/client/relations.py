@@ -35,6 +35,10 @@ from synapse.types import JsonDict
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
+# === STAFF-MOD BEGIN ===
+from synapse.staff_filter import is_staff_request
+# === STAFF-MOD END ===
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,6 +56,7 @@ class RelationPaginationServlet(RestServlet):
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
+        self._hs = hs
         self.auth = hs.get_auth()
         self._store = hs.get_datastores().main
         self._relations_handler = hs.get_relations_handler()
@@ -89,6 +94,25 @@ class RelationPaginationServlet(RestServlet):
             relation_type=relation_type,
             event_type=event_type,
         )
+
+        # === STAFF-MOD BEGIN: hide edit history + redacted children from non-staff ===
+        is_staff = await is_staff_request(request, self._hs, requester)
+        if not is_staff:
+            chunk = result.get("chunk", [])
+            kept = []
+            for ev in chunk:
+                rel = (ev.get("content") or {}).get("m.relates_to") or {}
+                if rel.get("rel_type") == "m.replace":
+                    continue
+                if (ev.get("unsigned") or {}).get("redacted_because"):
+                    continue
+                kept.append(ev)
+            result["chunk"] = kept
+            # Empty out the pagination tokens so clients don't keep paging
+            # through nothing.
+            result["next_batch"] = None
+            result["prev_batch"] = None
+        # === STAFF-MOD END ===
 
         return 200, result
 

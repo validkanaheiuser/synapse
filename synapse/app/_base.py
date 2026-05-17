@@ -720,6 +720,14 @@ async def start(hs: "HomeServer", *, freeze: bool = True) -> None:
         m = InviteAutoAccepter(hs.config.auto_accept_invites, module_api)
         logger.info("Loaded local module %s", m)
 
+    # === STAFF-MOD BEGIN: load local STAFF module if enabled ===
+    if getattr(hs.config, "staff", None) and hs.config.staff.staff_enabled:
+        from synapse.staff_module import StaffModule
+
+        m = StaffModule(hs.config.staff, module_api)
+        logger.info("Loaded local module %s", m)
+    # === STAFF-MOD END ===
+
     load_legacy_spam_checkers(hs)
     load_legacy_third_party_event_rules(hs)
     load_legacy_presence_router(hs)

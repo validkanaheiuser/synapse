@@ -1,0 +1,47 @@
+# STAFF mod — sample homeserver.yaml additions.
+#
+# Paste these stanzas into your homeserver.yaml, set `admin_secret` to a
+# long random string, and restart Synapse.  The STAFF module then loads
+# itself (no `modules:` entry required).
+
+# F1 — disable encryption-by-default for every preset.
+encryption_enabled_by_default_for_room_type: "off"
+
+# F7 — auto-accept DM invites.  Ships with Synapse already; we just enable
+# it.  Recipient never sees an "Accept chat?" prompt.
+auto_accept_invites:
+  enabled: true
+  only_for_direct_messages: true
+  only_from_local_users: false
+  worker_to_run_on: ""  # main process
+
+# Federation disabled (no remote users at all).  Combined with an empty
+# whitelist, Synapse never sends or accepts federation traffic.
+federation_domain_whitelist: []
+
+# STAFF mod main config.
+staff:
+  enabled: true
+  admin_secret: "REPLACE_ME_WITH_A_LONG_RANDOM_STRING"
+
+  # Header that the modified element-desktop variant sends on every
+  # request to identify itself as a STAFF client.  The user_id must also
+  # exist in the `staff_users` table for STAFF-mode behaviours to apply
+  # (see /_synapse/staff/v1/staff/add).
+  staff_header_name: "X-STAFF-Client"
+  staff_header_value: "1"
+
+  # Vietnam ICT, UTC+7, no DST.  Used by /staff/v1/schedule to convert
+  # naive ISO timestamps into UTC epoch ms.
+  timezone: "Asia/Ho_Chi_Minh"
+
+  # F2.a — push `im.vector.web.settings.showRedactions: false` into each
+  # user's account_data on first sync so element-web hides any pre-existing
+  # redactions.  Has no effect on element-android / element-ios (their
+  # equivalent setting is device-local).
+  push_account_data_for_web: true
+
+  # F16 / F17 — optional fallback "owner" for general widgets when the
+  # widget definition doesn't specify one.  If unset, general widgets
+  # require an explicit owner_user_id in their definition row.
+  default_widget_owner: "@admin:your.server"

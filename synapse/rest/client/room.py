@@ -90,6 +90,15 @@ from synapse.util.stringutils import parse_and_validate_server_name
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
+# === STAFF-MOD BEGIN ===
+from synapse.staff_filter import (
+    HIDDEN_STATE_TYPES,
+    is_redaction_event,
+    is_replace_relation,
+    is_staff_request,
+)
+# === STAFF-MOD END ===
+
 logger = logging.getLogger(__name__)
 
 
@@ -752,9 +761,13 @@ class RoomMemberListRestServlet(RestServlet):
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
+        self._hs = hs
         self.message_handler = hs.get_message_handler()
         self.auth = hs.get_auth()
         self.store = hs.get_datastores().main
+        # === STAFF-MOD BEGIN ===
+        self._storage_controllers = hs.get_storage_controllers()
+        # === STAFF-MOD END ===
 
     @cancellable
     async def on_GET(
@@ -796,6 +809,33 @@ class RoomMemberListRestServlet(RestServlet):
             ):
                 continue
             chunk.append(event)
+
+        # === STAFF-MOD BEGIN: obfuscate member list for non-staff (F5) ===
+        # For non-staff clients: return only the requester themselves plus
+        # anyone with PL > users_default (admins/mods/custom).  STAFF sees
+        # the full list.  Power levels are read directly from the current
+        # m.room.power_levels state event.
+        is_staff = await is_staff_request(request, self._hs, requester)
+        if not is_staff:
+            try:
+                pl_event = await self._storage_controllers.state.get_current_state_event(
+                    room_id, "m.room.power_levels", ""
+                )
+            except Exception:
+                pl_event = None
+            if pl_event is not None:
+                pl_users = (pl_event.content or {}).get("users") or {}
+                pl_users_default = (pl_event.content or {}).get("users_default", 0)
+            else:
+                pl_users = {}
+                pl_users_default = 0
+            self_mxid = requester.user.to_string()
+            chunk = [
+                m for m in chunk
+                if m["state_key"] == self_mxid
+                or pl_users.get(m["state_key"], pl_users_default) > pl_users_default
+            ]
+        # === STAFF-MOD END ===
 
         return 200, {"chunk": chunk}
 
@@ -937,6 +977,38 @@ class RoomMessageListRestServlet(RestServlet):
             event_filter=event_filter,
         )
 
+        # === STAFF-MOD BEGIN: strip hidden state + redacted + redactions
+        # + m.replace from /messages for non-staff ===
+        is_staff = await is_staff_request(request, self._hs, requester)
+        if not is_staff:
+            filtered: list = []
+            for fe in get_messages_result.messages_chunk:
+                ev = fe.event
+                ev_type = ev.type
+                if is_redaction_event(ev_type):
+                    continue
+                try:
+                    if ev.internal_metadata.is_redacted():
+                        continue
+                except Exception:
+                    pass
+                try:
+                    is_state = ev.is_state()
+                except Exception:
+                    is_state = getattr(ev, "state_key", None) is not None
+                if is_state and ev_type in HIDDEN_STATE_TYPES:
+                    continue
+                if ev_type == "m.room.message" and is_replace_relation(
+                    ev.content
+                ):
+                    # Edit history is hidden from non-staff (F3.b).
+                    continue
+                filtered.append(fe)
+            get_messages_result = attr.evolve(
+                get_messages_result, messages_chunk=filtered
+            )
+        # === STAFF-MOD END ===
+
         # Useful for debugging timeline/pagination issues. For example, if a client
         # isn't seeing the full history, we can check the homeserver logs to see if the
         # client just never made the next request with the given `end` token.
@@ -1036,6 +1108,7 @@ class RoomEventServlet(RestServlet):
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
+        self._hs = hs
         self.clock = hs.get_clock()
         self._store = hs.get_datastores().main
         self._state = hs.get_state_handler()
@@ -1103,6 +1176,31 @@ class RoomEventServlet(RestServlet):
             ):
                 raise UnredactedContentDeletedError(self.content_keep_ms)
 
+            # === STAFF-MOD BEGIN: hide redacted / m.replace / hidden-state from non-staff ===
+            is_staff = await is_staff_request(request, self._hs, requester)
+            if not is_staff:
+                hide = False
+                try:
+                    if event.internal_metadata.is_redacted():
+                        hide = True
+                except Exception:
+                    pass
+                if not hide and event.type == "m.room.redaction":
+                    hide = True
+                if not hide and event.type == "m.room.message" and is_replace_relation(
+                    event.content
+                ):
+                    hide = True
+                try:
+                    is_state = event.is_state()
+                except Exception:
+                    is_state = getattr(event, "state_key", None) is not None
+                if not hide and is_state and event.type in HIDDEN_STATE_TYPES:
+                    hide = True
+                if hide:
+                    raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
+            # === STAFF-MOD END ===
+
             # Ensure there are bundled aggregations available.
             aggregations = await self._relations_handler.get_bundled_aggregations(
                 [event], requester.user.to_string()
@@ -1152,6 +1250,45 @@ class RoomEventContextServlet(RestServlet):
 
         if not event_context:
             raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
+
+        # === STAFF-MOD BEGIN: strip hidden/redacted/redactions/m.replace ===
+        is_staff = await is_staff_request(request, self._hs, requester)
+
+        def _staff_keep_filtered(fe) -> bool:
+            ev = fe.event
+            ev_type = ev.type
+            if is_redaction_event(ev_type):
+                return False
+            try:
+                if ev.internal_metadata.is_redacted():
+                    return False
+            except Exception:
+                pass
+            try:
+                is_state = ev.is_state()
+            except Exception:
+                is_state = getattr(ev, "state_key", None) is not None
+            if is_state and ev_type in HIDDEN_STATE_TYPES:
+                return False
+            if ev_type == "m.room.message" and is_replace_relation(ev.content):
+                return False
+            return True
+
+        if not is_staff:
+            event_context = attr.evolve(
+                event_context,
+                events_before=[
+                    fe for fe in event_context.events_before
+                    if _staff_keep_filtered(fe)
+                ],
+                events_after=[
+                    fe for fe in event_context.events_after
+                    if _staff_keep_filtered(fe)
+                ],
+            )
+            if not _staff_keep_filtered(event_context.event):
+                raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
+        # === STAFF-MOD END ===
 
         time_now = self.clock.time_msec()
         serializer_options = SerializeEventConfig(requester=requester)
