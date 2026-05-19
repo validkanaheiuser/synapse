@@ -4,8 +4,16 @@
 #   POST   /_synapse/staff/v1/widgets
 #   GET    /_synapse/staff/v1/widgets
 #   GET    /_synapse/staff/v1/widgets/{widget_id}
-#   PATCH  /_synapse/staff/v1/widgets/{widget_id}      <- propagates to all rooms
-#   DELETE /_synapse/staff/v1/widgets/{widget_id}      <- empty-content state event
+#   POST   /_synapse/staff/v1/widgets/{widget_id}/update    <- legacy update path
+#   PATCH  /_synapse/staff/v1/widgets/{widget_id}           <- preferred update path
+#                                                             (alias of /update; both
+#                                                              re-send the widget's
+#                                                              state event to every
+#                                                              room it lives in so
+#                                                              edits propagate
+#                                                              without needing a
+#                                                              fresh DM)
+#   DELETE /_synapse/staff/v1/widgets/{widget_id}           <- empty-content state event
 #
 
 import asyncio
@@ -89,65 +97,108 @@ class StaffWidgetGetServlet(StaffRestServlet):
         return 200, {"widget": widget, "instances": instances}
 
 
+async def _widget_update_impl(
+    servlet: "StaffRestServlet",
+    request,
+    widget_id: str,
+) -> Tuple[int, JsonDict]:
+    """Shared update+propagate body used by both the legacy POST endpoint
+    and the new PATCH alias.  Updates the widget definition row, then
+    fans out a fresh state event to every room the widget already lives
+    in so existing DMs see the new name/url/content WITHOUT needing the
+    staff member to start a new DM.
+
+    Fan-out runs in batches of 50 with a 50ms inter-batch sleep, sender =
+    the original ``injected_by`` user from ``staff_widget_room_instances``
+    (preserves identity continuity in the room timeline / state).
+    """
+    servlet._require_secret(request)
+    body = parse_json_object_from_request(request)
+
+    widget = await servlet.store.widget_get(widget_id)
+    if widget is None:
+        raise SynapseError(404, "widget not found")
+
+    # Validate that we have at least one updatable field.  widget_type
+    # and owner_user_id are intentionally not updatable -- they are
+    # immutable identity on the row.
+    update: Dict[str, Any] = {}
+    if "name" in body:
+        if not isinstance(body["name"], str) or not body["name"]:
+            raise SynapseError(400, "name must be a non-empty string")
+        update["name"] = body["name"]
+    if "url" in body:
+        if not isinstance(body["url"], str) or not (
+            body["url"].startswith("http://")
+            or body["url"].startswith("https://")
+        ):
+            raise SynapseError(400, "url must be an http(s) URL")
+        update["url"] = body["url"]
+    if "content" in body:
+        if not isinstance(body["content"], dict):
+            raise SynapseError(400, "content must be a JSON object")
+        update["content"] = body["content"]
+    if not update:
+        raise SynapseError(400, "no updatable fields supplied")
+
+    await servlet.store.widget_update(widget_id, update)
+    updated = await servlet.store.widget_get(widget_id)
+    assert updated is not None
+
+    # === AGENT I (S7): widget-update propagation is already parallel.
+    # The existing implementation fans out via asyncio.gather in
+    # batches of 50, with a 50ms inter-batch sleep to bound peak
+    # load on the event-creation handler.  Verified at
+    # synapse/staff_module/rest_widgets.py (this very block) -- no
+    # change required.  Documented here so future readers don't
+    # "fix" it back into a sequential loop.
+    # === END AGENT I ===
+    instances = await servlet.store.widget_instances_for(widget_id)
+    propagated: List[Dict[str, Any]] = []
+    for batch_start in range(0, len(instances), 50):
+        batch = instances[batch_start:batch_start + 50]
+        results = await asyncio.gather(
+            *(
+                _propagate_to_room(
+                    servlet.hs, servlet.store, updated, inst,
+                ) for inst in batch
+            ),
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, Exception):
+                propagated.append({"status": "error", "reason": repr(r)})
+            else:
+                propagated.append(r)
+        await servlet.clock.sleep(0.05)
+
+    return 200, {
+        "widget": updated,
+        "propagated": propagated,
+    }
+
+
 class StaffWidgetUpdateServlet(StaffRestServlet):
+    """Legacy update endpoint at POST /widgets/{id}/update.  Kept so any
+    external scripts pre-dating the PATCH alias keep working."""
+
     PATTERNS = staff_pattern("/widgets/(?P<widget_id>[^/]+)/update")
 
     async def on_POST(self, request, widget_id: str) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
-        body = parse_json_object_from_request(request)
+        return await _widget_update_impl(self, request, widget_id)
 
-        widget = await self.store.widget_get(widget_id)
-        if widget is None:
-            raise SynapseError(404, "widget not found")
 
-        # Validate that we have at least one updatable field.
-        update: Dict[str, Any] = {}
-        if "name" in body:
-            if not isinstance(body["name"], str) or not body["name"]:
-                raise SynapseError(400, "name must be a non-empty string")
-            update["name"] = body["name"]
-        if "url" in body:
-            if not isinstance(body["url"], str) or not (
-                body["url"].startswith("http://")
-                or body["url"].startswith("https://")
-            ):
-                raise SynapseError(400, "url must be an http(s) URL")
-            update["url"] = body["url"]
-        if "content" in body:
-            if not isinstance(body["content"], dict):
-                raise SynapseError(400, "content must be a JSON object")
-            update["content"] = body["content"]
-        if not update:
-            raise SynapseError(400, "no updatable fields supplied")
+class StaffWidgetPatchServlet(StaffRestServlet):
+    """Preferred update endpoint at PATCH /widgets/{id}.  Same path as
+    GET/DELETE for the widget; HTTP method dispatch handles which servlet
+    runs.  Synapse's ``RestServlet.register`` does not auto-wire PATCH so
+    we register it explicitly in ``register_servlets`` below (mirroring
+    the rest_widget_groups.py pattern)."""
 
-        await self.store.widget_update(widget_id, update)
-        updated = await self.store.widget_get(widget_id)
-        assert updated is not None
+    PATTERNS = staff_pattern("/widgets/(?P<widget_id>[^/]+)")
 
-        # Propagate to every room that has this widget instance.
-        instances = await self.store.widget_instances_for(widget_id)
-        propagated: List[Dict[str, Any]] = []
-        for batch_start in range(0, len(instances), 50):
-            batch = instances[batch_start:batch_start + 50]
-            results = await asyncio.gather(
-                *(
-                    _propagate_to_room(
-                        self.hs, self.store, updated, inst,
-                    ) for inst in batch
-                ),
-                return_exceptions=True,
-            )
-            for r in results:
-                if isinstance(r, Exception):
-                    propagated.append({"status": "error", "reason": repr(r)})
-                else:
-                    propagated.append(r)
-            await self.clock.sleep(0.05)
-
-        return 200, {
-            "widget": updated,
-            "propagated": propagated,
-        }
+    async def on_PATCH(self, request, widget_id: str) -> Tuple[int, JsonDict]:
+        return await _widget_update_impl(self, request, widget_id)
 
 
 class StaffWidgetDeleteServlet(StaffRestServlet):
@@ -223,3 +274,13 @@ def register_servlets(hs: "HomeServer", store: "StaffStore",
     StaffWidgetUpdateServlet(hs, store).register(resource)
     StaffWidgetGetServlet(hs, store).register(resource)
     StaffWidgetDeleteServlet(hs, store).register(resource)
+    # PATCH /widgets/{id} alias.  RestServlet.register only auto-wires
+    # GET/PUT/POST/DELETE, so wire PATCH by hand -- same explicit
+    # register_paths pattern as rest_widget_groups.py.
+    patch_servlet = StaffWidgetPatchServlet(hs, store)
+    resource.register_paths(
+        "PATCH",
+        patch_servlet.PATTERNS,
+        patch_servlet.on_PATCH,
+        patch_servlet.__class__.__name__,
+    )

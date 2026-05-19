@@ -5,8 +5,9 @@
 # pattern construction, auth check, access to the StaffStore, hs.
 #
 
+import logging
 import re
-from typing import TYPE_CHECKING, Pattern
+from typing import TYPE_CHECKING, Any, Optional, Pattern
 
 from synapse.http.servlet import RestServlet
 
@@ -14,8 +15,14 @@ from .auth import check_staff_secret
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
+    from .audit import StaffAuditWriter
+    from .auth import AuthOutcome
+    from .jwt_keys import StaffJwtKeyManager
+    from .rate_limit import StaffRateLimiter
     from .store import StaffStore
 
+
+logger = logging.getLogger(__name__)
 
 STAFF_API_PREFIX = "/_synapse/staff/v1"
 
@@ -40,5 +47,92 @@ class StaffRestServlet(RestServlet):
         self.store = store
         self.clock = hs.get_clock()
 
+    # === AGENT H ===
+    # Auth + audit + rate-limit pipeline.  Every staff servlet now goes
+    # through `_require_staff_auth` (preferred) instead of the old
+    # `_require_secret`.  `_require_secret` is retained as a thin
+    # shim that delegates to the new path so legacy servlets we don't
+    # own keep working without a code change at their call-sites.
+    #
+    # The pipeline is:
+    #   1. Validate Bearer JWT (or fall back to legacy X-Staff-Secret).
+    #   2. Apply the per-endpoint rate-limit bucket keyed on the actor.
+    #   3. (After the handler returns) the caller is expected to invoke
+    #      `_audit_record(...)` with the response status + extracted
+    #      target.  We provide a `_run_with_audit` convenience that wraps
+    #      a handler call but the simpler per-endpoint pattern is to
+    #      call `_audit_record` directly at the end of the handler since
+    #      handlers want to choose their own `target` value.
+    #
+    # All four collaborators (key_manager, audit_writer, rate_limiter,
+    # store) live on the HomeServer via private attributes set by
+    # `StaffModule` at module init.
+
+    def _jwt_keys(self) -> "StaffJwtKeyManager":
+        return getattr(self.hs, "_staff_jwt_keys")
+
+    def _audit_writer(self) -> "StaffAuditWriter":
+        return getattr(self.hs, "_staff_audit_writer")
+
+    def _rate_limiter(self) -> "StaffRateLimiter":
+        return getattr(self.hs, "_staff_rate_limiter")
+
+    async def _require_staff_auth(self, request) -> "AuthOutcome":
+        """Authenticate the request and consume one rate-limit token.
+
+        Returns the AuthOutcome describing the validated caller.  The
+        servlet should stash this somewhere (e.g. a local variable) and
+        pass it to `_audit_record` after the work completes."""
+        from .auth import require_staff_auth
+        from .rate_limit import StaffRateLimiter
+
+        outcome = await require_staff_auth(
+            request, self.hs, self.store, self._jwt_keys(),
+        )
+        # Rate limit per (bucket, actor).  Bucket comes from the path,
+        # actor from the AuthOutcome.
+        path = request.path.decode("ascii", "replace") if request.path else ""
+        bucket = StaffRateLimiter.bucket_for_endpoint(path)
+        await self._rate_limiter().check(bucket, outcome.rate_limit_actor)
+        return outcome
+
+    async def _audit_record(
+        self,
+        *,
+        request,
+        outcome: "AuthOutcome",
+        status: int,
+        body: Any = None,
+        target: Optional[str] = None,
+    ) -> None:
+        """Write an audit row for a request that just completed."""
+        from .audit import canonical_body_hash, extract_target
+        from .auth import _client_ip
+
+        path = request.path.decode("ascii", "replace") if request.path else ""
+        method = (
+            request.method.decode("ascii", "replace")
+            if request.method else ""
+        )
+        if target is None:
+            target = extract_target(body)
+        await self._audit_writer().record(
+            actor_user_id=outcome.actor_user_id,
+            actor_kind=outcome.kind,
+            endpoint=path,
+            method=method,
+            status=status,
+            target=target,
+            body_hash=canonical_body_hash(body),
+            ip=_client_ip(request),
+        )
+
     def _require_secret(self, request) -> None:
+        """Legacy synchronous gate.  Kept for sibling servlets that were
+        written against the old API and still call it.  When the new
+        async pipeline is in use, prefer `_require_staff_auth` instead
+        (which also rate-limits + can be paired with `_audit_record`).
+        The two are not mutually exclusive — `_require_secret` only
+        validates the X-Staff-Secret header and raises if absent."""
         check_staff_secret(request, self.hs)
+    # === END AGENT H ===

@@ -8,12 +8,20 @@
 # small.
 #
 
-from typing import TYPE_CHECKING, Iterable, List, Optional
+from typing import TYPE_CHECKING, FrozenSet, Iterable, List, Optional
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
     from synapse.types import Requester
     from twisted.web.iweb import IRequest
+
+
+# === AGENT I (S15): memoisation slot for `get_hidden_state_types(hs)`.
+# We cache the computed frozenset on the HomeServer so the override is
+# read from config exactly once per process.  Stored under a dunder
+# attribute name to avoid colliding with anything user-facing.
+_HIDDEN_STATE_TYPES_ATTR = "_staff_hidden_state_types_cached"
+# === END AGENT I ===
 
 
 # Default header that the STAFF element-desktop variant sends on every
@@ -104,6 +112,38 @@ async def is_staff_request(
 
 def is_hidden_state_event(event_type: str) -> bool:
     return event_type in HIDDEN_STATE_TYPES
+
+
+# === AGENT I (S15): config-aware hidden-state lookup ===
+# Reads `hs.config.staff.staff_hidden_state_types` (set up by
+# `synapse.config.staff`) the first time it is called and memoises the
+# resulting frozenset on the HomeServer.  Callers that don't have an `hs`
+# handy (e.g. the patch in `rest/client/sync.py`) can stay on the
+# module-level `HIDDEN_STATE_TYPES` constant which carries the default;
+# callers that DO have `hs` should prefer `get_hidden_state_types(hs)` to
+# pick up operator overrides.  Both spellings stay in sync if no override
+# is configured.
+def get_hidden_state_types(hs: "HomeServer") -> FrozenSet[str]:
+    cached = getattr(hs, _HIDDEN_STATE_TYPES_ATTR, None)
+    if cached is not None:
+        return cached
+    try:
+        configured = hs.config.staff.staff_hidden_state_types
+    except AttributeError:
+        configured = None
+    if configured is None:
+        result = HIDDEN_STATE_TYPES
+    else:
+        result = frozenset(configured)
+    setattr(hs, _HIDDEN_STATE_TYPES_ATTR, result)
+    return result
+
+
+def is_hidden_state_event_for(hs: "HomeServer", event_type: str) -> bool:
+    """Like `is_hidden_state_event` but honours the per-deployment
+    override at `staff.hidden_state_types`.  Cheap after the first call."""
+    return event_type in get_hidden_state_types(hs)
+# === END AGENT I ===
 
 
 def partition_timeline_for_relocation(

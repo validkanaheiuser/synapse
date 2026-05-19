@@ -180,6 +180,10 @@ Changes in SCHEMA_VERSION = 95
     - STAFF mod: add staff_users, staff_settings, staff_scheduled_messages,
       staff_edit_history, staff_widget_definitions, staff_widget_room_instances,
       staff_account_data_pushed tables.
+    - STAFF mod (AGENT P): add staff_widget_groups, staff_widget_group_widgets,
+      staff_widget_group_members tables (sub-delta 95/05_widget_groups.sql) so
+      general_widgets are scoped to per-staff group membership instead of
+      injected for every staff.
 """
 
 

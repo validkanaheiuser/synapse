@@ -56,7 +56,26 @@ class WidgetInjector:
             "STAFF: detected staff %s joining DM %s — injecting widgets",
             target, room_id,
         )
-        await self._inject_widgets_for_staff(room_id, target)
+        # === AGENT I (S10): never block event persistence on widget injection.
+        # `on_new_event` runs on the hot path that follows `EventCreationHandler
+        # ._persist_events`; awaiting our forge calls here can stall every
+        # subsequent event in the room.  Hand the work off to a tracked
+        # background process so the event-persister returns immediately.
+        # `hs.run_as_background_process` is the high-level wrapper around
+        # `synapse.metrics.background_process_metrics.run_as_background_process`
+        # which handles SERVER_NAME labelling for us.
+        try:
+            self._hs.run_as_background_process(
+                "staff_widget_inject",
+                self._inject_widgets_for_staff,
+                room_id,
+                target,
+            )
+        except Exception:
+            logger.exception(
+                "STAFF: failed to schedule widget injection bg process"
+            )
+        # === END AGENT I ===
 
     async def _is_two_person_dm(self, room_id: str, staff_user: str) -> bool:
         main = self._hs.get_datastores().main
@@ -75,13 +94,32 @@ class WidgetInjector:
     async def _inject_widgets_for_staff(
         self, room_id: str, staff_user: str
     ) -> None:
-        # Combine general_widgets (all staff share) + staff_custom_widgets
-        # owned by THIS staff.
-        general = await self._store.widget_list(widget_type="general_widget")
+        # === AGENT P ===
+        # Group-scoped: general_widgets only get injected if THIS staff
+        # is in a group that contains them.  Custom widgets remain
+        # per-owner.  `widget_ids_for_user_via_groups` is a single
+        # round-trip SELECT joining the membership + widget join tables.
+        #
+        # Performance note: with at most a few dozen general widgets per
+        # group and a few groups per staff, the per-widget `widget_get`
+        # calls below are fine.  If first-DM injection latency becomes a
+        # problem we can replace the loop with a single SELECT-IN against
+        # `staff_widget_definitions` filtering by widget_type — flagged
+        # here as a future optimisation, not a current bug.
+        widget_ids_via_groups = (
+            await self._store.widget_ids_for_user_via_groups(staff_user)
+        )
+        general: List[dict] = []
+        if widget_ids_via_groups:
+            for wid in widget_ids_via_groups:
+                w = await self._store.widget_get(wid)
+                if w is not None and w["widget_type"] == "general_widget":
+                    general.append(w)
         custom = await self._store.widget_list(
             widget_type="staff_custom_widget", owner_user_id=staff_user,
         )
         widgets = list(general) + list(custom)
+        # === END AGENT P ===
 
         for w in widgets:
             existing = await self._store.widget_instance_get(

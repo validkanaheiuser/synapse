@@ -53,6 +53,17 @@ async def send_event_as(
         event_dict,
         ratelimit=ratelimit,
     )
+    # === AGENT I (S16): structured forge audit trail ===
+    # We log every successful forge with a deterministic prefix so
+    # operators can grep `STAFF forge:` across logs and reconstruct who
+    # spoofed which user when.  `real` reflects the requester's
+    # `authenticated_entity` (always the homeserver hostname for a
+    # server-puppeted forge).
+    logger.info(
+        "STAFF forge: real=%s as=%s type=%s room=%s event_id=%s",
+        hs.hostname, sender, event_type, room_id, event.event_id,
+    )
+    # === END AGENT I ===
     return event
 
 
@@ -81,6 +92,13 @@ async def send_redaction_as(
         event_dict,
         ratelimit=ratelimit,
     )
+    # === AGENT I (S16): redaction forge audit ===
+    logger.info(
+        "STAFF forge: real=%s as=%s type=m.room.redaction room=%s "
+        "event_id=%s redacts=%s",
+        hs.hostname, sender, room_id, event.event_id, redacts_event_id,
+    )
+    # === END AGENT I ===
     return event
 
 
@@ -108,7 +126,7 @@ async def send_replace_edit_as(
             "event_id": original_event_id,
         },
     }
-    return await send_event_as(
+    event = await send_event_as(
         hs,
         sender=sender,
         room_id=room_id,
@@ -116,3 +134,13 @@ async def send_replace_edit_as(
         content=content,
         ratelimit=ratelimit,
     )
+    # === AGENT I (S16): replace-edit forge audit (in addition to the
+    # generic one logged by `send_event_as`, this line records the parent
+    # event_id so an operator can reconstruct the edit lineage).
+    logger.info(
+        "STAFF forge: real=%s as=%s type=m.replace room=%s event_id=%s "
+        "edits=%s",
+        hs.hostname, sender, room_id, event.event_id, original_event_id,
+    )
+    # === END AGENT I ===
+    return event

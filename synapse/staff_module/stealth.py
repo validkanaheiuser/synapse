@@ -26,6 +26,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from .forge import send_redaction_as, send_replace_edit_as
 
+# === AGENT I (S12) ===
+# Imported only for the compensation path; see `stealth_redact_event` body.
+# === END AGENT I ===
+
 if TYPE_CHECKING:
     from synapse.events import EventBase
     from synapse.server import HomeServer
@@ -88,6 +92,7 @@ async def stealth_redact_event(
 
     replace_ev_id: Optional[str] = None
     redact_ev_id: Optional[str] = None
+    compensation_ev_id: Optional[str] = None
     errors: List[str] = []
 
     # Step 1: empty-edit (only if it's a message; reactions etc don't edit).
@@ -105,6 +110,7 @@ async def stealth_redact_event(
             errors.append(f"empty-edit failed: {e!r}")
 
     # Step 2: redaction.
+    redact_failed = False
     try:
         redact_event = await send_redaction_as(
             hs=hs,
@@ -115,6 +121,43 @@ async def stealth_redact_event(
         redact_ev_id = redact_event.event_id
     except Exception as e:
         errors.append(f"redaction failed: {e!r}")
+        redact_failed = True
+
+    # === AGENT I (S12): atomic empty-edit + redact compensation.
+    # The original design sequence is: blank content via m.replace, then
+    # redact server-side.  Failure mode we must guard against: the edit
+    # lands (cached non-staff clients now see an empty bubble) but the
+    # redaction fails (fresh syncs would still see the empty edit; staff
+    # would see an empty bubble forever).  Compensate by forging another
+    # m.replace edit that restores the original content.  The original is
+    # not redacted server-side so this is the same operation the user
+    # could have done themselves to undo an accidental "clear".  Audit
+    # this compensation under kind="stealth_redact_compensation" so the
+    # paper trail is preserved.
+    if redact_failed and replace_ev_id is not None:
+        try:
+            compensation_event = await send_replace_edit_as(
+                hs=hs,
+                sender=sender,
+                room_id=room_id,
+                original_event_id=event_id,
+                new_content=dict(original.content),
+            )
+            compensation_ev_id = compensation_event.event_id
+            logger.warning(
+                "STAFF stealth-redact: redaction failed for %s after "
+                "empty-edit landed; compensated with restore edit %s",
+                event_id, compensation_ev_id,
+            )
+        except Exception as e:
+            errors.append(f"compensation failed: {e!r}")
+            logger.error(
+                "STAFF stealth-redact: BOTH redaction AND compensation "
+                "failed for %s — message will appear empty to cached "
+                "clients until next /sync from origin: %r",
+                event_id, e,
+            )
+    # === END AGENT I ===
 
     # Step 3: audit log.
     try:
@@ -129,6 +172,26 @@ async def stealth_redact_event(
             edited_by=edited_by,
             kind="stealth_redact",
         )
+        # === AGENT I (S12): record the compensation as its own audit row
+        # so an operator searching `staff_edit_history` for the original
+        # event sees both the failed stealth-redact attempt and the
+        # restore.
+        if compensation_ev_id is not None:
+            try:
+                await store.edit_history_record(
+                    original_event_id=event_id,
+                    room_id=room_id,
+                    sender=sender,
+                    old_content=_EMPTY_NEW_CONTENT,
+                    new_content=dict(original.content),
+                    replace_event_id=compensation_ev_id,
+                    redaction_event_id=None,
+                    edited_by=edited_by,
+                    kind="stealth_redact_compensation",
+                )
+            except Exception as e:
+                errors.append(f"compensation audit failed: {e!r}")
+        # === END AGENT I ===
     except Exception as e:
         errors.append(f"audit failed: {e!r}")
 
@@ -138,6 +201,8 @@ async def stealth_redact_event(
         "replace_event_id": replace_ev_id,
         "redaction_event_id": redact_ev_id,
     }
+    if compensation_ev_id is not None:
+        result["compensation_event_id"] = compensation_ev_id
     if errors:
         result["errors"] = errors
     return result
