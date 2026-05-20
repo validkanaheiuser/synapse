@@ -24,7 +24,7 @@ class StaffCreateUserServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/create_user")
 
     async def on_POST(self, request) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         body = parse_json_object_from_request(request)
         username = body.get("username")
         password = body.get("password")
@@ -87,7 +87,7 @@ class StaffDeleteUsersServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/delete_users")
 
     async def on_POST(self, request) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         body = parse_json_object_from_request(request)
         usernames = body.get("usernames")
         if not isinstance(usernames, list) or not all(
@@ -147,7 +147,7 @@ class StaffForceLogoutServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/force_logout")
 
     async def on_POST(self, request) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         body = parse_json_object_from_request(request)
         usernames = body.get("usernames")
         if not isinstance(usernames, list) or not all(

@@ -94,7 +94,7 @@ class StaffScheduleCreateServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/schedule")
 
     async def on_POST(self, request) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         body = parse_json_object_from_request(request)
 
         parsed = _validate_payload(
@@ -148,7 +148,7 @@ class StaffScheduleListServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/schedule")
 
     async def on_GET(self, request) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         # Use the "_full" variant when available so callers see the
         # `image_body` column.  Falls back to the legacy list helper if
         # the schema delta has not been applied yet.
@@ -164,7 +164,7 @@ class StaffScheduleDeleteServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/schedule/(?P<task_id>[^/]+)")
 
     async def on_DELETE(self, request, task_id: str) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         removed = await cancel_scheduled(self.hs, self.store, task_id)
         return 200, {"task_id": task_id, "removed": removed}
 
@@ -177,7 +177,7 @@ class StaffScheduleDeleteServlet(StaffRestServlet):
         omitted from the JSON body is left unchanged on the row; passing
         `null` for `message` / `image_mxc` explicitly clears that field.
         """
-        self._require_secret(request)
+        await self._require_secret(request)
         body = parse_json_object_from_request(request)
 
         parsed = _validate_payload(

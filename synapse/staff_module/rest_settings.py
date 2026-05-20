@@ -25,14 +25,23 @@ if TYPE_CHECKING:
     from .store import StaffStore
 
 
-_VALID_KEY = re.compile(r"^[A-Za-z0-9_.\-]{1,128}$")
+# Allows the characters that legitimate KV keys actually use:
+#   - alphanumerics, underscore, dot, dash       — namespace + plain id
+#   - colon (`:`)                                — separator in compound keys
+#                                                  e.g. `nickname:<me>:<target>`,
+#                                                  `quickmsg:<id>`
+#   - at-sign (`@`)                              — MXID local-part marker
+#                                                  embedded in the keys above
+# Length bumped to 256 so two full MXIDs comfortably fit in a
+# nickname:<setter>:<target> key.
+_VALID_KEY = re.compile(r"^[A-Za-z0-9_.:@\-]{1,256}$")
 
 
 class StaffSettingsGetAllServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/settings/get/all")
 
     async def on_GET(self, request) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         # === AGENT I (S6): optional `?prefix=` server-side filter ===
         # Cheap to keep on the server: avoids round-tripping the full
         # settings table for callers that only care about a namespace
@@ -58,7 +67,7 @@ class StaffSettingsGetServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/settings/get/(?P<key>[^/]+)")
 
     async def on_GET(self, request, key: str) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         if not _VALID_KEY.match(key):
             raise SynapseError(400, "invalid key")
         value = await self.store.settings_get(key)
@@ -71,7 +80,7 @@ class StaffSettingsUpdateServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/settings/update/(?P<key>[^/]+)")
 
     async def on_POST(self, request, key: str) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         if not _VALID_KEY.match(key):
             raise SynapseError(400, "invalid key")
         value = parse_json_value_from_request(request)
@@ -83,7 +92,7 @@ class StaffSettingsDeleteServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/settings/(?P<key>[^/]+)")
 
     async def on_DELETE(self, request, key: str) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         if not _VALID_KEY.match(key):
             raise SynapseError(400, "invalid key")
         deleted = await self.store.settings_delete(key)

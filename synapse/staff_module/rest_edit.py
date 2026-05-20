@@ -35,7 +35,7 @@ class StaffEditMessageServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/edit_message")
 
     async def on_POST(self, request) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         body = parse_json_object_from_request(request)
         room_id = body.get("room_id")
         event_id = body.get("event_id")
@@ -97,7 +97,7 @@ class StaffEditHistoryServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/edit_history/(?P<event_id>[^/]+)")
 
     async def on_GET(self, request, event_id: str) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         rows = await self.store.edit_history_for(event_id)
         return 200, {"event_id": event_id, "edits": rows}
 

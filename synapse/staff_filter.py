@@ -106,8 +106,14 @@ async def is_staff_request(
         return False
 
     user_id = requester.user.to_string()
-    store = hs.get_datastores().main
-    return await store.is_staff_user(user_id)
+    # The staff allowlist lives on the StaffStore (attached as
+    # `hs._staff_store` by the staff_module init), NOT on the main
+    # DataStore.  is_staff_user is a synchronous in-memory set lookup,
+    # so no `await` is needed here.
+    staff_store = getattr(hs, "_staff_store", None)
+    if staff_store is None:
+        return False
+    return staff_store.is_staff_user(user_id)
 
 
 def is_hidden_state_event(event_type: str) -> bool:

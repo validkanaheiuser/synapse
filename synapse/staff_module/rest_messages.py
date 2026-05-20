@@ -58,7 +58,7 @@ class StaffWipeRoomServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/wipe_room")
 
     async def on_POST(self, request) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         body = parse_json_object_from_request(request)
         room_id = body.get("room_id")
         edited_by = body.get("edited_by", "secret")
@@ -112,7 +112,7 @@ class StaffDeleteMessagesServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/delete_messages")
 
     async def on_POST(self, request) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         body = parse_json_object_from_request(request)
         room_id = body.get("room_id")
         event_ids = body.get("event_ids")
@@ -165,7 +165,7 @@ class StaffRestoreMessageServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/restore_message")
 
     async def on_POST(self, request) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         body = parse_json_object_from_request(request)
         room_id = body.get("room_id")
         original_event_id = body.get("original_event_id")

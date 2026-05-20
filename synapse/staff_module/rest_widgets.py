@@ -44,7 +44,7 @@ class StaffWidgetCreateServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/widgets")
 
     async def on_POST(self, request) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         body = parse_json_object_from_request(request)
 
         owner = body.get("owner_user_id")
@@ -80,7 +80,7 @@ class StaffWidgetCreateServlet(StaffRestServlet):
         return 200, {"widget_id": widget_id}
 
     async def on_GET(self, request) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         rows = await self.store.widget_list()
         return 200, {"widgets": rows}
 
@@ -89,7 +89,7 @@ class StaffWidgetGetServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/widgets/(?P<widget_id>[^/]+)")
 
     async def on_GET(self, request, widget_id: str) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         widget = await self.store.widget_get(widget_id)
         if widget is None:
             raise SynapseError(404, "widget not found")
@@ -205,7 +205,7 @@ class StaffWidgetDeleteServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/widgets/(?P<widget_id>[^/]+)")
 
     async def on_DELETE(self, request, widget_id: str) -> Tuple[int, JsonDict]:
-        self._require_secret(request)
+        await self._require_secret(request)
         widget = await self.store.widget_get(widget_id)
         if widget is None:
             raise SynapseError(404, "widget not found")

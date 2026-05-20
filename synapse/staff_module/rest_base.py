@@ -127,12 +127,28 @@ class StaffRestServlet(RestServlet):
             ip=_client_ip(request),
         )
 
-    def _require_secret(self, request) -> None:
-        """Legacy synchronous gate.  Kept for sibling servlets that were
-        written against the old API and still call it.  When the new
-        async pipeline is in use, prefer `_require_staff_auth` instead
-        (which also rate-limits + can be paired with `_audit_record`).
-        The two are not mutually exclusive — `_require_secret` only
-        validates the X-Staff-Secret header and raises if absent."""
-        check_staff_secret(request, self.hs)
+    async def _require_secret(self, request) -> None:
+        """Lightweight authentication gate kept around for the many staff
+        endpoints that don't need the full audit + rate-limit pipeline of
+        `_require_staff_auth`.
+
+        Despite the historical name, this now accepts any of:
+          - `Authorization: Bearer <matrix_access_token>` whose MXID is in
+            the staff_users allowlist  (preferred — element-web uses this)
+          - `Authorization: Bearer <staff_jwt>`  (legacy /login_with_password)
+          - `X-Staff-Secret: <admin_secret>`     (legacy / unattended scripts)
+
+        Must be awaited.  Raises AuthError on failure."""
+        from synapse.api.errors import AuthError
+
+        from .auth import _check_bearer, _check_staff_secret, _read_bearer
+
+        if _read_bearer(request) is not None:
+            # _check_bearer dispatches Matrix-token vs staff-JWT internally
+            # and raises AuthError on any failure.  Returns an AuthOutcome
+            # we don't need here (audit-less legacy path).
+            await _check_bearer(request, self.hs, self.store, self._jwt_keys())
+            return
+        if not _check_staff_secret(request, self.hs):
+            raise AuthError(401, "Missing staff auth (Bearer token or X-Staff-Secret)")
     # === END AGENT H ===

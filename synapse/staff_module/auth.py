@@ -1,23 +1,27 @@
 #
 # STAFF mod — authentication for /_synapse/staff/v1/*.
 #
-# AGENT H — rewritten (S1).  Two auth modes are supported, in priority
-# order:
+# Three auth modes are supported, in priority order:
 #
-#   1. `Authorization: Bearer <jwt>`  — preferred.  Tokens are minted by
-#      POST /_synapse/staff/v1/login_with_password after the user proves
-#      they hold the password for a member of the `staff_users`
-#      allowlist.  See `jwt_keys.py` for the token format.
+#   1. `Authorization: Bearer <matrix_access_token>`  — preferred.  The
+#      caller's normal Matrix access token (obtained via the regular
+#      /_matrix/client/v3/login flow).  The token is resolved to a
+#      Requester via Synapse's own auth machinery; the user_id must then
+#      be in the staff_users allowlist.  No separate staff login is
+#      needed — element-web sends the same token it already has.
 #
-#   2. `X-Staff-Secret: <secret>`     — legacy / deprecated.  Still
-#      accepted so unattended scripts that pre-date the JWT rollout
-#      keep working.  Every legacy auth emits a `STAFF auth deprecated
-#      path` warning to nudge migration.
+#   2. `Authorization: Bearer <jwt>`  — legacy STAFF JWT minted by
+#      POST /_synapse/staff/v1/login_with_password.  Detected by token
+#      format (three dot-separated base64 parts).  Kept for backward
+#      compatibility with any client that still mints staff JWTs.
+#
+#   3. `X-Staff-Secret: <secret>`     — legacy / deprecated.  Used by
+#      the operator panel SPA and unattended scripts.  Every legacy
+#      secret auth emits a deprecation warning.
 #
 # `_require_staff_auth` is the only function the REST surface needs to
 # call.  It returns an `AuthOutcome` describing which mode succeeded,
-# the actor identity for audit, and the rate-limit key seed.  All other
-# helpers in this module are package-private to that flow.
+# the actor identity for audit, and the rate-limit key seed.
 #
 
 from __future__ import annotations
@@ -43,8 +47,10 @@ logger = logging.getLogger(__name__)
 class AuthOutcome:
     """Result of a successful staff-auth check.  `kind` is one of:
 
-        "jwt"     - validated via Bearer token; `actor_user_id` is the
-                    JWT `sub` claim and `jti` is the unique token id.
+        "matrix"  - validated via the caller's regular Matrix access
+                    token; `actor_user_id` is the resolved MXID.
+        "jwt"     - validated via legacy staff Bearer token; `actor_user_id`
+                    is the JWT `sub` claim and `jti` is the unique token id.
         "secret"  - validated via legacy X-Staff-Secret; `actor_user_id`
                     is None (no caller identity is conveyed by the
                     shared secret).
@@ -122,33 +128,56 @@ def _read_bearer(request: "IRequest") -> Optional[str]:
     return token
 
 
-async def _check_bearer(
-    request: "IRequest",
+def _looks_like_staff_jwt(token: str) -> bool:
+    """A staff JWT is a compact-form JWS: exactly three base64url segments
+    joined by dots.  Matrix access tokens are opaque (`syt_...`) and never
+    contain that many dots, so the count is enough to disambiguate."""
+    return token.count(".") == 2
+
+
+async def _check_bearer_matrix(
+    token: str,
+    hs: "HomeServer",
+    store: "StaffStore",
+) -> AuthOutcome:
+    """Validate a Matrix access token via Synapse's own auth machinery,
+    then require the resolved user_id be in the staff_users allowlist.
+    Raises AuthError(401) on a bad token, AuthError(403) on a valid token
+    whose user is not staff."""
+    try:
+        requester = await hs.get_auth().get_user_by_access_token(token)
+    except AuthError:
+        raise
+    except Exception as e:
+        logger.info("STAFF matrix-token verify failed: %s", e)
+        raise AuthError(401, "Invalid access token")
+    user_id = requester.user.to_string()
+    if not store.is_staff_user(user_id):
+        raise AuthError(403, "User is not in the staff allowlist")
+    return AuthOutcome(
+        kind="matrix",
+        actor_user_id=user_id,
+        jti=None,
+        rate_limit_actor=f"user:{user_id}",
+    )
+
+
+async def _check_bearer_jwt(
+    token: str,
     hs: "HomeServer",
     store: "StaffStore",
     key_manager: "StaffJwtKeyManager",
-) -> Optional[AuthOutcome]:
-    """Validate a Bearer JWT.  Returns an AuthOutcome on success, None
-    if no Bearer header was present (so the caller can try the legacy
-    secret path).  Raises AuthError(401) on any validation failure."""
-    token = _read_bearer(request)
-    if token is None:
-        return None
+) -> AuthOutcome:
+    """Validate a STAFF-minted JWT."""
     try:
         payload = await key_manager.verify(token)
     except ValueError as e:
-        # Don't leak the precise reason to clients — the parameter name
-        # alone is enough.  The body message stays generic; details are
-        # in the server log.
         logger.info("STAFF JWT verify failed: %s", e)
         raise AuthError(401, "Invalid token")
     sub = payload["sub"]
     jti = payload["jti"]
-    # Revocation list: jti must not be in staff_jwt_revocations.
     if await store.jwt_revocation_check(jti):
         raise AuthError(401, "Token revoked")
-    # Staff allowlist must still contain `sub` (staff status may have
-    # been revoked since the token was minted).
     if not store.is_staff_user(sub):
         raise AuthError(401, "User no longer staff")
     return AuthOutcome(
@@ -157,6 +186,23 @@ async def _check_bearer(
         jti=jti,
         rate_limit_actor=f"jti:{jti}",
     )
+
+
+async def _check_bearer(
+    request: "IRequest",
+    hs: "HomeServer",
+    store: "StaffStore",
+    key_manager: "StaffJwtKeyManager",
+) -> Optional[AuthOutcome]:
+    """Dispatch a Bearer token to the right validator based on its shape.
+    Returns None if no Bearer header was present (caller can try the
+    legacy secret path).  Raises AuthError on validation failures."""
+    token = _read_bearer(request)
+    if token is None:
+        return None
+    if _looks_like_staff_jwt(token):
+        return await _check_bearer_jwt(token, hs, store, key_manager)
+    return await _check_bearer_matrix(token, hs, store)
 
 
 # ----------------------------------------------------------------- entry point

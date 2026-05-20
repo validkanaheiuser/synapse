@@ -86,6 +86,17 @@ class StaffGroupListCreateServlet(StaffRestServlet):
         description = _validate_description(body.get("description"))
         created_by = outcome.actor_user_id or "secret"
 
+        # Reject duplicate names — the schema has no UNIQUE constraint on
+        # `name`, so we check here instead.  A concurrent-create race can
+        # still slip past (rare in operator-UI flows); add a UNIQUE index
+        # to staff_widget_groups.name if that ever becomes a real issue.
+        if await self.store.group_id_by_name(name) is not None:
+            raise SynapseError(
+                409,
+                f"a group named {name!r} already exists",
+                errcode="M_NAME_IN_USE",
+            )
+
         group_id = await self.store.group_create(
             name=name, description=description, created_by=created_by,
         )

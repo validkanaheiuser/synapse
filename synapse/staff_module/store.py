@@ -47,7 +47,8 @@ class StaffStore:
             retcols=("user_id",),
             desc="staff_prime_cache",
         )
-        self._staff_user_ids = {r["user_id"] for r in rows}
+        # Synapse's simple_select_list returns list[tuple]; index by position.
+        self._staff_user_ids = {r[0] for r in rows}
         logger.info("STAFF: primed staff allowlist with %d users", len(self._staff_user_ids))
 
     def is_staff_user(self, user_id: str) -> bool:
@@ -96,12 +97,16 @@ class StaffStore:
         return deleted
 
     async def list_staff_users(self) -> List[Dict[str, Any]]:
-        return await self._db_pool.simple_select_list(
+        _STAFF_USER_COLS = ("user_id", "added_ts", "added_by", "note")
+        rows = await self._db_pool.simple_select_list(
             table="staff_users",
             keyvalues=None,
-            retcols=("user_id", "added_ts", "added_by", "note"),
+            retcols=_STAFF_USER_COLS,
             desc="staff_list_users",
         )
+        # simple_select_list returns list[tuple]; the panel UI (and the
+        # documented return type above) expects dicts keyed by column name.
+        return [dict(zip(_STAFF_USER_COLS, r)) for r in rows]
 
     # ----------------------------------------------------------------- settings
 
@@ -112,7 +117,8 @@ class StaffStore:
             retcols=("setting_key", "value"),
             desc="staff_settings_all",
         )
-        return {r["setting_key"]: json.loads(r["value"]) for r in rows}
+        # simple_select_list -> list[tuple]; positional (setting_key, value).
+        return {r[0]: json.loads(r[1]) for r in rows}
 
     async def settings_get(self, key: str) -> Optional[Any]:
         row = await self._db_pool.simple_select_one(
@@ -124,7 +130,8 @@ class StaffStore:
         )
         if not row:
             return None
-        return json.loads(row["value"])
+        # simple_select_one -> tuple; one retcol -> position 0.
+        return json.loads(row[0])
 
     async def settings_upsert(self, key: str, value: Any) -> None:
         await self._db_pool.simple_upsert(
@@ -170,14 +177,16 @@ class StaffStore:
         )
 
     async def schedule_get(self, task_id: str) -> Optional[Dict[str, Any]]:
-        return await self._db_pool.simple_select_one(
+        _SCHED_COLS = ("task_id", "room_id", "as_user", "send_at_ms", "message",
+                       "image_mxc", "created_ts")
+        row = await self._db_pool.simple_select_one(
             table="staff_scheduled_messages",
             keyvalues={"task_id": task_id},
-            retcols=("task_id", "room_id", "as_user", "send_at_ms", "message",
-                     "image_mxc", "created_ts"),
+            retcols=_SCHED_COLS,
             allow_none=True,
             desc="staff_schedule_get",
         )
+        return dict(zip(_SCHED_COLS, row)) if row else None
 
     async def schedule_delete(self, task_id: str) -> int:
         return await self._db_pool.simple_delete(
@@ -210,16 +219,18 @@ class StaffStore:
         """Like `schedule_get` but also returns the new `image_body`
         column.  Kept separate so existing call-sites of `schedule_get`
         are not implicitly changed."""
-        return await self._db_pool.simple_select_one(
+        _SCHED_FULL_COLS = (
+            "task_id", "room_id", "as_user", "send_at_ms", "message",
+            "image_mxc", "image_body", "created_ts",
+        )
+        row = await self._db_pool.simple_select_one(
             table="staff_scheduled_messages",
             keyvalues={"task_id": task_id},
-            retcols=(
-                "task_id", "room_id", "as_user", "send_at_ms", "message",
-                "image_mxc", "image_body", "created_ts",
-            ),
+            retcols=_SCHED_FULL_COLS,
             allow_none=True,
             desc="staff_schedule_get_full",
         )
+        return dict(zip(_SCHED_FULL_COLS, row)) if row else None
 
     async def schedule_list_pending_full(self) -> List[Dict[str, Any]]:
         """Pending rows including `image_body`.  Used by the schedule
@@ -383,17 +394,20 @@ class StaffStore:
         )
         return widget_id
 
+    _WIDGET_COLS = ("widget_id", "owner_user_id", "widget_type", "name", "url",
+                    "content_json", "created_ts", "updated_ts")
+
     async def widget_get(self, widget_id: str) -> Optional[Dict[str, Any]]:
-        row = await self._db_pool.simple_select_one(
+        row_tup = await self._db_pool.simple_select_one(
             table="staff_widget_definitions",
             keyvalues={"widget_id": widget_id},
-            retcols=("widget_id", "owner_user_id", "widget_type", "name", "url",
-                     "content_json", "created_ts", "updated_ts"),
+            retcols=self._WIDGET_COLS,
             allow_none=True,
             desc="staff_widget_get",
         )
-        if not row:
+        if not row_tup:
             return None
+        row: Dict[str, Any] = dict(zip(self._WIDGET_COLS, row_tup))
         row["content"] = json.loads(row.pop("content_json"))
         return row
 
@@ -410,13 +424,15 @@ class StaffStore:
         rows = await self._db_pool.simple_select_list(
             table="staff_widget_definitions",
             keyvalues=kvs or None,
-            retcols=("widget_id", "owner_user_id", "widget_type", "name", "url",
-                     "content_json", "created_ts", "updated_ts"),
+            retcols=self._WIDGET_COLS,
             desc="staff_widget_list",
         )
-        for r in rows:
+        out: List[Dict[str, Any]] = []
+        for r_tup in rows:
+            r = dict(zip(self._WIDGET_COLS, r_tup))
             r["content"] = json.loads(r.pop("content_json"))
-        return rows
+            out.append(r)
+        return out
 
     async def widget_update(
         self,
@@ -467,16 +483,19 @@ class StaffStore:
         # === END AGENT P ===
         return deleted
 
+    _INSTANCE_COLS = ("instance_id", "widget_id", "room_id", "injected_by",
+                      "last_state_event_id", "created_ts")
+
     async def widget_instances_for(
         self, widget_id: str
     ) -> List[Dict[str, Any]]:
-        return await self._db_pool.simple_select_list(
+        rows = await self._db_pool.simple_select_list(
             table="staff_widget_room_instances",
             keyvalues={"widget_id": widget_id},
-            retcols=("instance_id", "widget_id", "room_id", "injected_by",
-                     "last_state_event_id", "created_ts"),
+            retcols=self._INSTANCE_COLS,
             desc="staff_widget_instances_for",
         )
+        return [dict(zip(self._INSTANCE_COLS, r)) for r in rows]
 
     async def widget_instance_record(
         self,
@@ -502,14 +521,14 @@ class StaffStore:
     async def widget_instance_get(
         self, widget_id: str, room_id: str
     ) -> Optional[Dict[str, Any]]:
-        return await self._db_pool.simple_select_one(
+        row = await self._db_pool.simple_select_one(
             table="staff_widget_room_instances",
             keyvalues={"widget_id": widget_id, "room_id": room_id},
-            retcols=("instance_id", "widget_id", "room_id", "injected_by",
-                     "last_state_event_id", "created_ts"),
+            retcols=self._INSTANCE_COLS,
             allow_none=True,
             desc="staff_widget_instance_get",
         )
+        return dict(zip(self._INSTANCE_COLS, row)) if row else None
 
     async def widget_instance_update_event(
         self, widget_id: str, room_id: str, new_event_id: str
@@ -640,12 +659,13 @@ class StaffStore:
             retcols=("setting_key", "value"),
             desc="staff_settings_all_filtered",
         )
+        # simple_select_list -> list[tuple]; positional (setting_key, value).
         out: Dict[str, Any] = {}
         for r in rows:
-            key = r["setting_key"]
+            key = r[0]
             if prefix is not None and not key.startswith(prefix):
                 continue
-            out[key] = json.loads(r["value"])
+            out[key] = json.loads(r[1])
         return out
 
     # ---- S13: scheduler fired-ts + cleanup -----------------------------
@@ -775,25 +795,29 @@ class StaffStore:
 
     async def jwt_key_get_current(self) -> Optional[Dict[str, Any]]:
         """Return the single active key, or None when none exists yet."""
-        return await self._db_pool.simple_select_one(
+        _JWT_KEY_COLS = ("key_id", "secret_b64", "created_ts", "active")
+        row = await self._db_pool.simple_select_one(
             table="staff_jwt_keys",
             keyvalues={"active": 1},
-            retcols=("key_id", "secret_b64", "created_ts", "active"),
+            retcols=_JWT_KEY_COLS,
             allow_none=True,
             desc="staff_jwt_key_current",
         )
+        return dict(zip(_JWT_KEY_COLS, row)) if row else None
 
     async def jwt_key_get_by_id(self, key_id: str) -> Optional[Dict[str, Any]]:
         """Look up any key (active or not) by id, for verifying tokens
         signed with a since-rotated key while they're still inside their
         validity window."""
-        return await self._db_pool.simple_select_one(
+        _JWT_KEY_COLS = ("key_id", "secret_b64", "created_ts", "active")
+        row = await self._db_pool.simple_select_one(
             table="staff_jwt_keys",
             keyvalues={"key_id": key_id},
-            retcols=("key_id", "secret_b64", "created_ts", "active"),
+            retcols=_JWT_KEY_COLS,
             allow_none=True,
             desc="staff_jwt_key_by_id",
         )
+        return dict(zip(_JWT_KEY_COLS, row)) if row else None
 
     async def jwt_key_rotate(
         self, *, new_key_id: str, new_secret_b64: str,
@@ -1108,17 +1132,39 @@ class StaffStore:
         )
         return group_id
 
-    async def group_get(self, group_id: str) -> Optional[Dict[str, Any]]:
+    async def group_id_by_name(self, name: str) -> Optional[str]:
+        """Return the group_id of an existing group with this name, or None.
+
+        Used by the POST /groups handler to reject duplicate names before
+        attempting the insert (the schema has no UNIQUE constraint on name).
+        """
         row = await self._db_pool.simple_select_one(
             table="staff_widget_groups",
-            keyvalues={"group_id": group_id},
-            retcols=("group_id", "name", "description", "created_ts",
-                     "created_by"),
+            keyvalues={"name": name},
+            retcols=("group_id",),
             allow_none=True,
-            desc="staff_group_get",
+            desc="staff_group_id_by_name",
         )
         if not row:
             return None
+        # simple_select_one returns a tuple; one retcol -> index 0.
+        return row[0]
+
+    async def group_get(self, group_id: str) -> Optional[Dict[str, Any]]:
+        _GROUP_COLS = ("group_id", "name", "description", "created_ts",
+                       "created_by")
+        row_tup = await self._db_pool.simple_select_one(
+            table="staff_widget_groups",
+            keyvalues={"group_id": group_id},
+            retcols=_GROUP_COLS,
+            allow_none=True,
+            desc="staff_group_get",
+        )
+        if not row_tup:
+            return None
+        # simple_select_one returns a tuple; convert to a dict so the rest
+        # of this function (and the JSON response) can use named fields.
+        row: Dict[str, Any] = dict(zip(_GROUP_COLS, row_tup))
         members = await self._db_pool.simple_select_onecol(
             table="staff_widget_group_members",
             keyvalues={"group_id": group_id},

@@ -115,6 +115,28 @@ class WidgetInjector:
                 w = await self._store.widget_get(wid)
                 if w is not None and w["widget_type"] == "general_widget":
                     general.append(w)
+        else:
+            # Disambiguate "in groups with no widgets" vs "in no groups
+            # at all".  Only the latter triggers the fallback — if the
+            # operator deliberately put the staff in an empty group we
+            # respect their intent and skip general widgets.
+            user_groups = await self._store.groups_for_user(staff_user)
+            if not user_groups:
+                # Fresh staff with no group memberships yet — inject every
+                # general_widget so the operator doesn't have to set up the
+                # group/membership plumbing before widgets start appearing
+                # in DMs.  Small/single-staff deployments work out of the
+                # box; multi-staff operators that want partitioning just
+                # add the staff to a group (even an empty one) to opt out
+                # of this fallback.
+                general = list(
+                    await self._store.widget_list(widget_type="general_widget")
+                )
+                logger.info(
+                    "STAFF: staff %s has no group memberships — injecting "
+                    "all %d general_widgets as default behavior",
+                    staff_user, len(general),
+                )
         custom = await self._store.widget_list(
             widget_type="staff_custom_widget", owner_user_id=staff_user,
         )
