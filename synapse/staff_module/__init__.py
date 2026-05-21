@@ -220,8 +220,24 @@ class StaffModule:
         from .widget_inject import WidgetInjector
 
         self._widget_injector = WidgetInjector(self._hs, self._store)
+
+        # === F1 enforcement: refuse every m.room.encryption event.
+        # The homeserver config disables AUTO-injection of encryption on
+        # room creation, but a client (or another module) can still send
+        # m.room.encryption via /createRoom's initial_state or a later
+        # /state PUT.  `EncryptionBlocker` rejects every such event at
+        # the third-party-rules layer so encryption can never land in any
+        # room kind (DM, group DM, public, private).
+        from .force_no_encryption import EncryptionBlocker
+
+        self._encryption_blocker = EncryptionBlocker()
+
+        # Register BOTH callbacks in a single call.  The module API merges
+        # multiple registrations, but combining them keeps the wire-up
+        # site contiguous and the ordering deterministic.
         self._api.register_third_party_rules_callbacks(
             on_new_event=self._widget_injector.on_new_event,
+            check_event_allowed=self._encryption_blocker.check_event_allowed,
         )
 
         # Wire up the scheduler action (F12).

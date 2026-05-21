@@ -45,16 +45,49 @@ class WidgetInjector:
         target = event.state_key
         if not isinstance(target, str):
             return
-        if not self._store.is_staff_user(target):
-            return
 
         room_id = event.room_id
-        if not await self._is_two_person_dm(room_id, target):
-            return
+
+        # Resolve which staff user (if any) we should inject widgets for.
+        # Two cases:
+        #
+        # (A) Staff joined.  Classic F16 case — the joiner IS the staff
+        #     member.  Inject the joiner's widgets.  Works for the
+        #     "user-invited-staff" + auto-accept-invite flow because the
+        #     auto-accept module materialises the join as a normal
+        #     membership event that fans through here.
+        #
+        # (B) Non-staff joined a room where staff is already present.
+        #     This catches the inverse "staff-invited-user" flow: staff
+        #     created the DM, sent an invite, then the invitee joined.
+        #     At staff's own join time (Case A's trigger) the room only
+        #     had one member, so the DM check failed.  Now that the
+        #     second member has arrived we can finally inject.  We
+        #     locate the staff member by scanning the current member
+        #     list — single short list in a DM, cheap.
+        #
+        # Either case is required to land on the same `_inject_widgets_
+        # for_staff(room_id, staff_user)` path so the widget-instance
+        # dedupe (`widget_instance_get`) prevents double-injection if
+        # the trigger somehow fires twice.
+        staff_user: Optional[str] = None
+        if self._store.is_staff_user(target):
+            if not await self._is_two_person_dm(room_id, target):
+                return
+            staff_user = target
+        else:
+            # Non-staff joiner — look for staff in the room.
+            staff_in_room = await self._find_staff_in_room(room_id)
+            if staff_in_room is None:
+                return
+            if not await self._is_two_person_dm(room_id, staff_in_room):
+                return
+            staff_user = staff_in_room
 
         logger.info(
-            "STAFF: detected staff %s joining DM %s — injecting widgets",
-            target, room_id,
+            "STAFF: 2-person DM %s now contains staff %s "
+            "(triggered by %s joining) — injecting widgets",
+            room_id, staff_user, target,
         )
         # === AGENT I (S10): never block event persistence on widget injection.
         # `on_new_event` runs on the hot path that follows `EventCreationHandler
@@ -69,13 +102,33 @@ class WidgetInjector:
                 "staff_widget_inject",
                 self._inject_widgets_for_staff,
                 room_id,
-                target,
+                staff_user,
             )
         except Exception:
             logger.exception(
                 "STAFF: failed to schedule widget injection bg process"
             )
         # === END AGENT I ===
+
+    async def _find_staff_in_room(self, room_id: str) -> Optional[str]:
+        """Return the MXID of any staff user currently in `room_id`, or
+        None.  Used by Case B (non-staff joiner) to figure out whose
+        widgets to inject.  In a 2-person DM there's at most one staff
+        member; we return the first one found.  Cheap: pulls the small
+        member list and does a single `is_staff_user` check per member.
+        """
+        main = self._hs.get_datastores().main
+        try:
+            members: Set[str] = await main.get_users_in_room(room_id)
+        except Exception:
+            return None
+        for mxid in members:
+            try:
+                if self._store.is_staff_user(mxid):
+                    return mxid
+            except Exception:
+                continue
+        return None
 
     async def _is_two_person_dm(self, room_id: str, staff_user: str) -> bool:
         main = self._hs.get_datastores().main

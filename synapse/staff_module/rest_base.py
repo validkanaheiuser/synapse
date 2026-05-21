@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING, Any, Optional, Pattern
 
 from synapse.http.servlet import RestServlet
 
-from .auth import check_staff_secret
+# Note: `check_staff_secret` is intentionally NOT imported here any more.
+# `_require_secret` (below) now delegates to the multi-mode auth pipeline
+# in `.auth._check_bearer` + `._check_staff_secret`, supporting Matrix
+# access tokens / staff JWTs / X-Staff-Secret in priority order.
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
