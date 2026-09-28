@@ -10,7 +10,7 @@
 #
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from twisted.internet import defer
 
@@ -216,10 +216,17 @@ class StaffModule:
         # route requests to `/_synapse/staff/v1/...`.
         self._api.register_web_resource("/_synapse/staff", self._json_resource)
 
-        # Wire up event hooks (F16 widget DM detection).
+        # Wire up event hooks (F16 widget DM detection + Auto-reply).
         from .widget_inject import WidgetInjector
+        from .auto_reply import AutoReplyManager
 
         self._widget_injector = WidgetInjector(self._hs, self._store)
+        self._auto_reply_manager = AutoReplyManager(self._hs, self._store)
+        setattr(self._hs, "_staff_auto_reply_mgr", self._auto_reply_manager)
+
+        clock.call_when_running(
+            lambda: defer.ensureDeferred(self._auto_reply_manager.ensure_loaded())
+        )
 
         # === F1 enforcement: refuse every m.room.encryption event.
         # The homeserver config disables AUTO-injection of encryption on
@@ -232,11 +239,15 @@ class StaffModule:
 
         self._encryption_blocker = EncryptionBlocker()
 
-        # Register BOTH callbacks in a single call.  The module API merges
+        async def _combined_on_new_event(event: Any, state: Any = None) -> None:
+            await self._widget_injector.on_new_event(event, state)
+            await self._auto_reply_manager.on_new_event(event, state)
+
+        # Register callbacks in a single call.  The module API merges
         # multiple registrations, but combining them keeps the wire-up
         # site contiguous and the ordering deterministic.
         self._api.register_third_party_rules_callbacks(
-            on_new_event=self._widget_injector.on_new_event,
+            on_new_event=_combined_on_new_event,
             check_event_allowed=self._encryption_blocker.check_event_allowed,
         )
 
@@ -290,6 +301,7 @@ class StaffModule:
             rest_edit,
             rest_schedule,
             rest_widgets,
+            rest_autoreply,
         )
         # === AGENT H ===
         from . import rest_auth  # S1 login/refresh/logout + S3 audit-list
@@ -313,6 +325,7 @@ class StaffModule:
             rest_edit,
             rest_schedule,
             rest_widgets,
+            rest_autoreply,
             # === AGENT H ===
             rest_auth,
             # === END AGENT H ===

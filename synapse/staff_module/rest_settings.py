@@ -7,6 +7,7 @@
 #   DELETE /_synapse/staff/v1/settings/{key}
 #
 
+import json
 import re
 from typing import TYPE_CHECKING, Tuple
 
@@ -17,7 +18,7 @@ from synapse.http.servlet import (
 )
 from synapse.types import JsonDict
 
-from .rest_base import StaffRestServlet, staff_pattern
+from .rest_base import STAFF_API_PREFIX, StaffRestServlet, staff_pattern
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -38,7 +39,10 @@ _VALID_KEY = re.compile(r"^[A-Za-z0-9_.:@\-]{1,256}$")
 
 
 class StaffSettingsGetAllServlet(StaffRestServlet):
-    PATTERNS = staff_pattern("/settings/get/all")
+    PATTERNS = (
+        re.compile("^" + re.escape(STAFF_API_PREFIX) + r"/settings/get/all/?$"),
+        re.compile(r"^/_synapse/staff/settings/get/all/?$"),
+    )
 
     async def on_GET(self, request) -> Tuple[int, JsonDict]:
         await self._require_secret(request)
@@ -60,24 +64,49 @@ class StaffSettingsGetAllServlet(StaffRestServlet):
                 return 200, {"settings": rows, "prefix": prefix}
         # === END AGENT I ===
         rows = await self.store.settings_get_all()
+        if "auto_reply" not in rows:
+            mgr = getattr(self.hs, "_staff_auto_reply_mgr", None)
+            if mgr is not None:
+                rows["auto_reply"] = mgr.get_config()
+            else:
+                rows["auto_reply"] = {"enabled": False, "message": ""}
         return 200, {"settings": rows}
 
 
 class StaffSettingsGetServlet(StaffRestServlet):
-    PATTERNS = staff_pattern("/settings/get/(?P<key>[^/]+)")
+    PATTERNS = (
+        re.compile("^" + re.escape(STAFF_API_PREFIX) + r"/settings/get/(?P<key>[^/]+)/?$"),
+        re.compile(r"^/_synapse/staff/settings/get/(?P<key>[^/]+)/?$"),
+    )
 
     async def on_GET(self, request, key: str) -> Tuple[int, JsonDict]:
         await self._require_secret(request)
         if not _VALID_KEY.match(key):
             raise SynapseError(400, "invalid key")
         value = await self.store.settings_get(key)
+        if key in ("auto_reply", "autoreply"):
+            mgr = getattr(self.hs, "_staff_auto_reply_mgr", None)
+            if value is None:
+                if mgr is not None:
+                    value = mgr.get_config()
+                else:
+                    value = {"enabled": False, "message": ""}
+            elif isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except Exception:
+                    pass
+            return 200, {"key": key, "value": value}
         if value is None:
             raise SynapseError(404, "not found")
         return 200, {"key": key, "value": value}
 
 
 class StaffSettingsUpdateServlet(StaffRestServlet):
-    PATTERNS = staff_pattern("/settings/update/(?P<key>[^/]+)")
+    PATTERNS = (
+        re.compile("^" + re.escape(STAFF_API_PREFIX) + r"/settings/update/(?P<key>[^/]+)/?$"),
+        re.compile(r"^/_synapse/staff/settings/update/(?P<key>[^/]+)/?$"),
+    )
 
     async def on_POST(self, request, key: str) -> Tuple[int, JsonDict]:
         await self._require_secret(request)
@@ -85,17 +114,31 @@ class StaffSettingsUpdateServlet(StaffRestServlet):
             raise SynapseError(400, "invalid key")
         value = parse_json_value_from_request(request)
         await self.store.settings_upsert(key, value)
+        if key in ("auto_reply", "autoreply"):
+            mgr = getattr(self.hs, "_staff_auto_reply_mgr", None)
+            if mgr is not None and isinstance(value, dict):
+                mgr.update_config(
+                    bool(value.get("enabled", False)),
+                    str(value.get("message", "") or ""),
+                )
         return 200, {"key": key, "value": value}
 
 
 class StaffSettingsDeleteServlet(StaffRestServlet):
-    PATTERNS = staff_pattern("/settings/(?P<key>[^/]+)")
+    PATTERNS = (
+        re.compile("^" + re.escape(STAFF_API_PREFIX) + r"/settings/(?P<key>[^/]+)/?$"),
+        re.compile(r"^/_synapse/staff/settings/(?P<key>[^/]+)/?$"),
+    )
 
     async def on_DELETE(self, request, key: str) -> Tuple[int, JsonDict]:
         await self._require_secret(request)
         if not _VALID_KEY.match(key):
             raise SynapseError(400, "invalid key")
         deleted = await self.store.settings_delete(key)
+        if key in ("auto_reply", "autoreply"):
+            mgr = getattr(self.hs, "_staff_auto_reply_mgr", None)
+            if mgr is not None:
+                mgr.update_config(False, "")
         return 200, {"key": key, "removed": bool(deleted)}
 
 
