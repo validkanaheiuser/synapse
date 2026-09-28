@@ -67,9 +67,13 @@ from ._base import client_patterns, set_timeline_upper_limit
 # === STAFF-MOD BEGIN ===
 from synapse.staff_filter import (
     HIDDEN_STATE_TYPES,
+    get_room_pl_users,
     is_redaction_event,
     is_replace_relation,
     is_staff_request,
+    mask_ephemeral_events_for_non_staff,
+    mask_event_dict_for_non_staff,
+    mask_summary_for_non_staff,
 )
 # === STAFF-MOD END ===
 
@@ -355,7 +359,8 @@ class SyncRestServlet(RestServlet):
         )
 
         invited = await self.encode_invited(
-            sync_result.invited, time_now, stripped_serialize_options
+            sync_result.invited, time_now, stripped_serialize_options,
+            is_staff=is_staff, requester_user=sync_config.user.to_string(),
         )
 
         knocked = await self.encode_knocked(
@@ -378,6 +383,11 @@ class SyncRestServlet(RestServlet):
             response["presence"] = SyncRestServlet.encode_presence(
                 sync_result.presence, time_now
             )
+            if not is_staff and isinstance(response["presence"], dict):
+                staff_store = getattr(self.hs, "_staff_store", None)
+                self_mxid = sync_config.user.to_string()
+                for pev in response["presence"].get("events", []):
+                    mask_event_dict_for_non_staff(pev, self_mxid, is_staff, staff_store, None)
 
         if sync_result.to_device:
             response["to_device"] = {"events": sync_result.to_device}
@@ -465,6 +475,8 @@ class SyncRestServlet(RestServlet):
         rooms: list[InvitedSyncResult],
         time_now: int,
         serialize_options: SerializeEventConfig,
+        is_staff: bool = False,
+        requester_user: Optional[str] = None,
     ) -> JsonDict:
         """
         Encode the invited rooms in a sync result
@@ -493,6 +505,13 @@ class SyncRestServlet(RestServlet):
 
             invited_state = list(invited_state)
             invited_state.append(invite)
+
+            if not is_staff:
+                staff_store = getattr(self.hs, "_staff_store", None)
+                room_pl_users = await get_room_pl_users(self.hs, room.room_id)
+                for ev in invited_state:
+                    mask_event_dict_for_non_staff(ev, requester_user, is_staff, staff_store, room_pl_users)
+
             invited[room.room_id] = {"invite_state": {"events": invited_state}}
 
         return invited
@@ -749,6 +768,26 @@ class SyncRestServlet(RestServlet):
             result["summary"] = room.summary
             if self._msc2654_enabled:
                 result["org.matrix.msc2654.unread_count"] = room.unread_count
+
+        # === STAFF-MOD BEGIN: mask usernames for non-staff ===
+        if not is_staff:
+            staff_store = getattr(self.hs, "_staff_store", None)
+            requester_user = sync_config.user.to_string()
+            room_pl_users = await get_room_pl_users(self.hs, room.room_id)
+            for ev in serialized_timeline:
+                mask_event_dict_for_non_staff(ev, requester_user, is_staff, staff_store, room_pl_users)
+            for ev in serialized_state:
+                mask_event_dict_for_non_staff(ev, requester_user, is_staff, staff_store, room_pl_users)
+            if "ephemeral" in result and isinstance(result["ephemeral"], dict):
+                ephem_events = result["ephemeral"].get("events")
+                if isinstance(ephem_events, list):
+                    mask_ephemeral_events_for_non_staff(ephem_events, requester_user, is_staff, staff_store, room_pl_users)
+            if "summary" in result and isinstance(result["summary"], dict):
+                mask_summary_for_non_staff(result["summary"], requester_user, is_staff, staff_store, room_pl_users)
+            if "msc4354_sticky" in result and isinstance(result["msc4354_sticky"], dict):
+                for ev in result["msc4354_sticky"].get("events", []):
+                    mask_event_dict_for_non_staff(ev, requester_user, is_staff, staff_store, room_pl_users)
+        # === STAFF-MOD END ===
 
         return result
 

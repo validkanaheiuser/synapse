@@ -36,7 +36,11 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 # === STAFF-MOD BEGIN ===
-from synapse.staff_filter import is_staff_request
+from synapse.staff_filter import (
+    get_room_pl_users,
+    is_staff_request,
+    mask_event_dict_for_non_staff,
+)
 # === STAFF-MOD END ===
 
 logger = logging.getLogger(__name__)
@@ -122,6 +126,11 @@ class RelationPaginationServlet(RestServlet):
                         if await staff_store.is_redacted_by_staff(red_id, self._store):
                             continue
                 kept.append(ev)
+            staff_store = getattr(self._hs, "_staff_store", None)
+            pl_users = await get_room_pl_users(self._hs, room_id)
+            self_mxid = requester.user.to_string()
+            for ev in kept:
+                mask_event_dict_for_non_staff(ev, self_mxid, is_staff, staff_store, pl_users)
             result["chunk"] = kept
             # Empty out the pagination tokens only if no relations were kept.
             if not kept:

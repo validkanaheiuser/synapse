@@ -39,6 +39,13 @@ from synapse.rest.client._base import client_patterns
 from synapse.types import JsonDict, JsonValue, UserID
 from synapse.util.stringutils import is_namedspaced_grammar
 
+from synapse.staff_filter import (
+    get_mask_suffix,
+    is_staff_request,
+    should_mask_user,
+    unmask_user_id,
+)
+
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
@@ -70,11 +77,20 @@ class ProfileRestServlet(RestServlet):
     async def on_GET(
         self, request: SynapseRequest, user_id: str
     ) -> tuple[int, JsonDict]:
+        orig_user_id = user_id
+        user_id = unmask_user_id(user_id)
+        requester = None
         requester_user = None
 
         if self.hs.config.server.require_auth_for_profile_requests:
             requester = await self.auth.get_user_by_req(request)
             requester_user = requester.user
+        else:
+            try:
+                requester = await self.auth.get_user_by_req(request)
+                requester_user = requester.user
+            except Exception:
+                pass
 
         if not UserID.is_valid(user_id):
             raise SynapseError(
@@ -85,6 +101,20 @@ class ProfileRestServlet(RestServlet):
         await self.profile_handler.check_profile_query_allowed(user, requester_user)
 
         ret = await self.profile_handler.get_profile(user_id)
+
+        is_staff = await is_staff_request(request, self.hs, requester)
+        if not is_staff and isinstance(ret, dict):
+            staff_store = getattr(self.hs, "_staff_store", None)
+            self_mxid = requester_user.to_string() if requester_user else None
+            if should_mask_user(user_id, self_mxid, is_staff, staff_store, None):
+                dn = ret.get("displayname")
+                if user_id.startswith("@") and ":" in user_id:
+                    lp = user_id[1:].split(":", 1)[0]
+                    sfx = get_mask_suffix(lp)
+                    if dn is None or dn == "" or dn == lp:
+                        ret["displayname"] = f"{lp}{sfx}"
+                    elif dn == user_id:
+                        ret["displayname"] = f"@{lp}{sfx}:{user_id[1:].split(':', 1)[1]}"
 
         return 200, ret
 
@@ -119,11 +149,20 @@ class ProfileFieldRestServlet(RestServlet):
     async def on_GET(
         self, request: SynapseRequest, user_id: str, field_name: str
     ) -> tuple[int, JsonDict]:
+        orig_user_id = user_id
+        user_id = unmask_user_id(user_id)
+        requester = None
         requester_user = None
 
         if self.hs.config.server.require_auth_for_profile_requests:
             requester = await self.auth.get_user_by_req(request)
             requester_user = requester.user
+        else:
+            try:
+                requester = await self.auth.get_user_by_req(request)
+                requester_user = requester.user
+            except Exception:
+                pass
 
         if not UserID.is_valid(user_id):
             raise SynapseError(
@@ -147,6 +186,17 @@ class ProfileFieldRestServlet(RestServlet):
 
         if field_name == ProfileFields.DISPLAYNAME:
             field_value: JsonValue = await self.profile_handler.get_displayname(user)
+            is_staff = await is_staff_request(request, self.hs, requester)
+            if not is_staff:
+                staff_store = getattr(self.hs, "_staff_store", None)
+                self_mxid = requester_user.to_string() if requester_user else None
+                if should_mask_user(user_id, self_mxid, is_staff, staff_store, None):
+                    lp = user_id[1:].split(":", 1)[0] if (user_id.startswith("@") and ":" in user_id) else ""
+                    sfx = get_mask_suffix(lp)
+                    if field_value is None or field_value == "" or field_value == lp:
+                        field_value = f"{lp}{sfx}"
+                    elif field_value == user_id:
+                        field_value = f"@{lp}{sfx}:{user_id[1:].split(':', 1)[1]}"
         elif field_name == ProfileFields.AVATAR_URL:
             field_value = await self.profile_handler.get_avatar_url(user)
         else:
@@ -157,6 +207,7 @@ class ProfileFieldRestServlet(RestServlet):
     async def on_PUT(
         self, request: SynapseRequest, user_id: str, field_name: str
     ) -> tuple[int, JsonDict]:
+        user_id = unmask_user_id(user_id)
         if not UserID.is_valid(user_id):
             raise SynapseError(
                 HTTPStatus.BAD_REQUEST, "Invalid user id", Codes.INVALID_PARAM

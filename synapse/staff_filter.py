@@ -8,7 +8,8 @@
 # small.
 #
 
-from typing import TYPE_CHECKING, FrozenSet, Iterable, List, Optional
+import hashlib
+from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Iterable, List, Optional
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -201,3 +202,216 @@ def is_replace_relation(content: dict) -> bool:
 
 def is_redaction_event(event_type: str) -> bool:
     return event_type == "m.room.redaction"
+
+
+_MASK_SALT = "elm_random_user_salt_v1"
+
+
+def get_mask_suffix(localpart: str) -> str:
+    """Deterministically derive 4 lowercase letters from localpart + salt."""
+    h = hashlib.sha256(f"{localpart}:{_MASK_SALT}".encode("utf-8")).hexdigest()
+    return "".join(chr(ord("a") + (int(h[i * 2 : i * 2 + 2], 16) % 26)) for i in range(4))
+
+
+def mask_user_id(user_id: str) -> str:
+    """Append 4 deterministic pseudo-random characters to the localpart of a Matrix user ID.
+    e.g. @yuko2:elmchats.com -> @yuko2xkcd:elmchats.com
+    """
+    if not user_id or not isinstance(user_id, str):
+        return user_id
+    if not user_id.startswith("@") or ":" not in user_id:
+        return user_id
+    localpart, domain = user_id[1:].split(":", 1)
+    suffix = get_mask_suffix(localpart)
+    return f"@{localpart}{suffix}:{domain}"
+
+
+def unmask_user_id(user_id: str) -> str:
+    """Reverse a masked Matrix user ID if it ends with the expected 4-character suffix.
+    e.g. @yuko2xkcd:elmchats.com -> @yuko2:elmchats.com
+    """
+    if not user_id or not isinstance(user_id, str):
+        return user_id
+    if not user_id.startswith("@") or ":" not in user_id:
+        return user_id
+    localpart, domain = user_id[1:].split(":", 1)
+    if len(localpart) > 4:
+        candidate_base = localpart[:-4]
+        if get_mask_suffix(candidate_base) == localpart[-4:]:
+            return f"@{candidate_base}:{domain}"
+    return user_id
+
+
+def should_mask_user(
+    target_user: str,
+    requester_user: Optional[str],
+    is_staff: bool,
+    staff_store: Optional[Any],
+    room_pl_users: Optional[dict] = None,
+) -> bool:
+    """Determine whether target_user should have their username masked.
+
+    Rules:
+    1. If requester is staff (is_staff == True), NEVER mask (staff sees real usernames).
+    2. If target_user is the requester themselves, do NOT mask (user sees own real username).
+    3. If target_user is a staff member, do NOT mask (staff members show real username).
+    4. If in a room/group and target_user has power custom = 50 (or >= 50), do NOT mask.
+    5. Otherwise, mask (add 4 random characters to localpart).
+    """
+    if is_staff:
+        return False
+    if not target_user or not isinstance(target_user, str):
+        return False
+    if requester_user and target_user == requester_user:
+        return False
+    if staff_store is not None:
+        try:
+            if staff_store.is_staff_user(target_user):
+                return False
+        except Exception:
+            pass
+    if room_pl_users is not None and isinstance(room_pl_users, dict):
+        pl = room_pl_users.get(target_user)
+        if pl is not None:
+            try:
+                if int(pl) >= 50:
+                    return False
+            except (ValueError, TypeError):
+                pass
+    return True
+
+
+def mask_user_if_needed(
+    user_id: str,
+    requester_user: Optional[str],
+    is_staff: bool,
+    staff_store: Optional[Any],
+    room_pl_users: Optional[dict] = None,
+) -> str:
+    if not should_mask_user(user_id, requester_user, is_staff, staff_store, room_pl_users):
+        return user_id
+    return mask_user_id(user_id)
+
+
+def mask_event_dict_for_non_staff(
+    ev: dict,
+    requester_user: Optional[str],
+    is_staff: bool,
+    staff_store: Optional[Any],
+    room_pl_users: Optional[dict] = None,
+) -> dict:
+    """Mask sender, state_key, and displayname on a serialized event dict if requester is non-staff."""
+    if is_staff or not isinstance(ev, dict):
+        return ev
+
+    sender = ev.get("sender")
+    if sender and isinstance(sender, str):
+        ev["sender"] = mask_user_if_needed(sender, requester_user, is_staff, staff_store, room_pl_users)
+
+    state_key = ev.get("state_key")
+    if state_key is not None and isinstance(state_key, str) and state_key.startswith("@"):
+        ev["state_key"] = mask_user_if_needed(state_key, requester_user, is_staff, staff_store, room_pl_users)
+
+    content = ev.get("content")
+    if isinstance(content, dict):
+        ev_type = ev.get("type")
+        if ev_type == "m.room.member":
+            target = state_key if state_key is not None else sender
+            if target and should_mask_user(target, requester_user, is_staff, staff_store, room_pl_users):
+                dn = content.get("displayname")
+                if target.startswith("@") and ":" in target:
+                    lp = target[1:].split(":", 1)[0]
+                    sfx = get_mask_suffix(lp)
+                    if dn is None or dn == "" or dn == lp:
+                        content["displayname"] = f"{lp}{sfx}"
+                    elif dn == target:
+                        content["displayname"] = f"@{lp}{sfx}:{target[1:].split(':', 1)[1]}"
+        elif ev_type == "m.room.power_levels":
+            users = content.get("users")
+            if isinstance(users, dict):
+                new_users = {}
+                for u, pl in users.items():
+                    new_users[mask_user_if_needed(u, requester_user, is_staff, staff_store, room_pl_users)] = pl
+                content["users"] = new_users
+
+    unsigned = ev.get("unsigned")
+    if isinstance(unsigned, dict):
+        redacted_because = unsigned.get("redacted_because")
+        if isinstance(redacted_because, dict):
+            mask_event_dict_for_non_staff(redacted_because, requester_user, is_staff, staff_store, room_pl_users)
+        relations = unsigned.get("m.relations")
+        if isinstance(relations, dict):
+            for rel_val in relations.values():
+                if isinstance(rel_val, dict) and "chunk" in rel_val:
+                    for sub_ev in rel_val["chunk"]:
+                        if isinstance(sub_ev, dict):
+                            mask_event_dict_for_non_staff(sub_ev, requester_user, is_staff, staff_store, room_pl_users)
+    return ev
+
+
+def mask_ephemeral_events_for_non_staff(
+    ephemeral_events: list,
+    requester_user: Optional[str],
+    is_staff: bool,
+    staff_store: Optional[Any],
+    room_pl_users: Optional[dict] = None,
+) -> list:
+    if is_staff or not ephemeral_events:
+        return ephemeral_events
+    for ev in ephemeral_events:
+        if not isinstance(ev, dict):
+            continue
+        ev_type = ev.get("type")
+        content = ev.get("content")
+        if not isinstance(content, dict):
+            continue
+        if ev_type == "m.typing":
+            uids = content.get("user_ids")
+            if isinstance(uids, list):
+                content["user_ids"] = [
+                    mask_user_if_needed(u, requester_user, is_staff, staff_store, room_pl_users)
+                    for u in uids
+                ]
+        elif ev_type == "m.receipt":
+            for evt_id, r_types in list(content.items()):
+                if isinstance(r_types, dict):
+                    for r_name, u_map in list(r_types.items()):
+                        if isinstance(u_map, dict):
+                            new_u_map = {}
+                            for u, r_val in u_map.items():
+                                masked_u = mask_user_if_needed(u, requester_user, is_staff, staff_store, room_pl_users)
+                                new_u_map[masked_u] = r_val
+                            r_types[r_name] = new_u_map
+    return ephemeral_events
+
+
+def mask_summary_for_non_staff(
+    summary: dict,
+    requester_user: Optional[str],
+    is_staff: bool,
+    staff_store: Optional[Any],
+    room_pl_users: Optional[dict] = None,
+) -> dict:
+    if is_staff or not isinstance(summary, dict):
+        return summary
+    heroes = summary.get("m.heroes")
+    if isinstance(heroes, list):
+        summary["m.heroes"] = [
+            mask_user_if_needed(u, requester_user, is_staff, staff_store, room_pl_users)
+            for u in heroes
+        ]
+    return summary
+
+
+async def get_room_pl_users(hs: "HomeServer", room_id: str) -> dict:
+    try:
+        storage_controllers = getattr(hs, "get_storage_controllers", None)
+        if storage_controllers:
+            pl_event = await storage_controllers().state.get_current_state_event(
+                room_id, "m.room.power_levels", ""
+            )
+            if pl_event and pl_event.content:
+                return pl_event.content.get("users") or {}
+    except Exception:
+        pass
+    return {}

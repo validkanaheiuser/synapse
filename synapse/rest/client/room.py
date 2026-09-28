@@ -93,9 +93,16 @@ if TYPE_CHECKING:
 # === STAFF-MOD BEGIN ===
 from synapse.staff_filter import (
     HIDDEN_STATE_TYPES,
+    get_mask_suffix,
+    get_room_pl_users,
     is_redaction_event,
     is_replace_relation,
     is_staff_request,
+    mask_event_dict_for_non_staff,
+    mask_user_id,
+    mask_user_if_needed,
+    should_mask_user,
+    unmask_user_id,
 )
 # === STAFF-MOD END ===
 
@@ -208,6 +215,12 @@ class RoomCreateRestServlet(TransactionRestServlet):
 
     def get_room_config(self, request: Request) -> JsonDict:
         user_supplied_config = parse_json_object_from_request(request)
+        if isinstance(user_supplied_config, dict):
+            invites = user_supplied_config.get("invite")
+            if isinstance(invites, list):
+                user_supplied_config["invite"] = [
+                    unmask_user_id(u) if isinstance(u, str) else u for u in invites
+                ]
         return user_supplied_config
 
 
@@ -217,6 +230,7 @@ class RoomStateEventRestServlet(RestServlet):
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
+        self._hs = hs
         self.event_creation_handler = hs.get_event_creation_handler()
         self.room_member_handler = hs.get_room_member_handler()
         self.message_handler = hs.get_message_handler()
@@ -283,6 +297,9 @@ class RoomStateEventRestServlet(RestServlet):
             request, "format", default="content", allowed_values=["content", "event"]
         )
 
+        orig_state_key = state_key
+        state_key = unmask_user_id(state_key)
+
         msg_handler = self.message_handler
         data = await msg_handler.get_room_data(
             requester=requester,
@@ -294,6 +311,8 @@ class RoomStateEventRestServlet(RestServlet):
         if not data:
             raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
 
+        is_staff = await is_staff_request(request, self._hs, requester)
+
         if format == "event":
             event = await self._event_serializer.serialize_event(
                 FilteredEvent.state(data),
@@ -303,9 +322,37 @@ class RoomStateEventRestServlet(RestServlet):
                     requester=requester,
                 ),
             )
+            if not is_staff and isinstance(event, dict):
+                staff_store = getattr(self._hs, "_staff_store", None)
+                pl_users = await get_room_pl_users(self._hs, room_id)
+                mask_event_dict_for_non_staff(
+                    event, requester.user.to_string(), is_staff, staff_store, pl_users
+                )
             return 200, event
         elif format == "content":
-            return 200, data.get_dict()["content"]
+            ret_content = dict(data.get_dict()["content"])
+            if not is_staff:
+                staff_store = getattr(self._hs, "_staff_store", None)
+                pl_users = await get_room_pl_users(self._hs, room_id)
+                self_mxid = requester.user.to_string()
+                if event_type == "m.room.member":
+                    if should_mask_user(state_key, self_mxid, is_staff, staff_store, pl_users):
+                        dn = ret_content.get("displayname")
+                        if state_key.startswith("@") and ":" in state_key:
+                            lp = state_key[1:].split(":", 1)[0]
+                            sfx = get_mask_suffix(lp)
+                            if dn is None or dn == "" or dn == lp:
+                                ret_content["displayname"] = f"{lp}{sfx}"
+                            elif dn == state_key:
+                                ret_content["displayname"] = f"@{lp}{sfx}:{state_key[1:].split(':', 1)[1]}"
+                elif event_type == "m.room.power_levels":
+                    users = ret_content.get("users")
+                    if isinstance(users, dict):
+                        new_users = {}
+                        for u, pl in users.items():
+                            new_users[mask_user_if_needed(u, self_mxid, is_staff, staff_store, pl_users)] = pl
+                        ret_content["users"] = new_users
+            return 200, ret_content
 
         # Format must be event or content, per the parse_string call above.
         raise RuntimeError(f"Unknown format: {format:r}.")
@@ -318,6 +365,7 @@ class RoomStateEventRestServlet(RestServlet):
         state_key: str,
         txn_id: str | None = None,
     ) -> tuple[int, JsonDict]:
+        state_key = unmask_user_id(state_key)
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
 
         if txn_id:
@@ -442,6 +490,13 @@ class RoomSendEventRestServlet(TransactionRestServlet):
         txn_id: str | None,
     ) -> tuple[int, JsonDict]:
         content = parse_json_object_from_request(request)
+        if isinstance(content, dict):
+            mentions = content.get("m.mentions")
+            if isinstance(mentions, dict) and isinstance(mentions.get("user_ids"), list):
+                mentions["user_ids"] = [
+                    unmask_user_id(u) if isinstance(u, str) else u
+                    for u in mentions["user_ids"]
+                ]
 
         origin_server_ts = None
         if requester.app_service:
@@ -810,11 +865,7 @@ class RoomMemberListRestServlet(RestServlet):
                 continue
             chunk.append(event)
 
-        # === STAFF-MOD BEGIN: obfuscate member list for non-staff (F5) ===
-        # For non-staff clients: return only the requester themselves plus
-        # anyone with PL > users_default (admins/mods/custom).  STAFF sees
-        # the full list.  Power levels are read directly from the current
-        # m.room.power_levels state event.
+        # === STAFF-MOD BEGIN: mask member list usernames for non-staff ===
         is_staff = await is_staff_request(request, self._hs, requester)
         if not is_staff:
             try:
@@ -825,16 +876,12 @@ class RoomMemberListRestServlet(RestServlet):
                 pl_event = None
             if pl_event is not None:
                 pl_users = (pl_event.content or {}).get("users") or {}
-                pl_users_default = (pl_event.content or {}).get("users_default", 0)
             else:
                 pl_users = {}
-                pl_users_default = 0
+            staff_store = getattr(self._hs, "_staff_store", None)
             self_mxid = requester.user.to_string()
-            chunk = [
-                m for m in chunk
-                if m["state_key"] == self_mxid
-                or pl_users.get(m["state_key"], pl_users_default) > pl_users_default
-            ]
+            for m in chunk:
+                mask_event_dict_for_non_staff(m, self_mxid, is_staff, staff_store, pl_users)
         # === STAFF-MOD END ===
 
         return 200, {"chunk": chunk}
@@ -848,6 +895,7 @@ class JoinedRoomMemberListRestServlet(RestServlet):
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
+        self._hs = hs
         self.message_handler = hs.get_message_handler()
         self.auth = hs.get_auth()
 
@@ -859,6 +907,25 @@ class JoinedRoomMemberListRestServlet(RestServlet):
         users_with_profile = await self.message_handler.get_joined_members(
             requester, room_id
         )
+
+        is_staff = await is_staff_request(request, self._hs, requester)
+        if not is_staff and isinstance(users_with_profile, dict):
+            staff_store = getattr(self._hs, "_staff_store", None)
+            pl_users = await get_room_pl_users(self._hs, room_id)
+            self_mxid = requester.user.to_string()
+            masked_profiles = {}
+            for uid, prof in users_with_profile.items():
+                masked_uid = mask_user_if_needed(uid, self_mxid, is_staff, staff_store, pl_users)
+                if prof and isinstance(prof, dict):
+                    dn = prof.get("display_name")
+                    if should_mask_user(uid, self_mxid, is_staff, staff_store, pl_users):
+                        lp = uid[1:].split(":", 1)[0] if (uid.startswith("@") and ":" in uid) else ""
+                        sfx = get_mask_suffix(lp)
+                        if dn is None or dn == "" or dn == lp:
+                            prof = dict(prof)
+                            prof["display_name"] = f"{lp}{sfx}"
+                masked_profiles[masked_uid] = prof
+            users_with_profile = masked_profiles
 
         return 200, {"joined": users_with_profile}
 
@@ -1052,6 +1119,15 @@ class RoomMessageListRestServlet(RestServlet):
             room_size=_RoomSize.from_member_count(room_member_count),
             **{SERVER_NAME_LABEL: self.server_name},
         ).observe((processing_end_time - processing_start_time) / 1000)
+
+        if not is_staff and isinstance(response_content, dict):
+            staff_store = getattr(self._hs, "_staff_store", None)
+            pl_users = await get_room_pl_users(self._hs, room_id)
+            self_mxid = requester.user.to_string()
+            for ev in response_content.get("chunk", []):
+                mask_event_dict_for_non_staff(ev, self_mxid, is_staff, staff_store, pl_users)
+            for ev in response_content.get("state", []):
+                mask_event_dict_for_non_staff(ev, self_mxid, is_staff, staff_store, pl_users)
 
         return 200, response_content
 
@@ -1286,6 +1362,12 @@ class RoomEventServlet(RestServlet):
                 bundle_aggregations=aggregations,
                 config=SerializeEventConfig(requester=requester),
             )
+            if not is_staff and isinstance(event_dict, dict):
+                staff_store = getattr(self._hs, "_staff_store", None)
+                pl_users = await get_room_pl_users(self._hs, room_id)
+                mask_event_dict_for_non_staff(
+                    event_dict, requester.user.to_string(), is_staff, staff_store, pl_users
+                )
             return 200, event_dict
 
         raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
@@ -1416,6 +1498,19 @@ class RoomEventContextServlet(RestServlet):
             "end": event_context.end,
         }
 
+        if not is_staff and isinstance(results, dict):
+            staff_store = getattr(self._hs, "_staff_store", None)
+            pl_users = await get_room_pl_users(self._hs, room_id)
+            self_mxid = requester.user.to_string()
+            for ev in results.get("events_before", []):
+                mask_event_dict_for_non_staff(ev, self_mxid, is_staff, staff_store, pl_users)
+            if "event" in results:
+                mask_event_dict_for_non_staff(results["event"], self_mxid, is_staff, staff_store, pl_users)
+            for ev in results.get("events_after", []):
+                mask_event_dict_for_non_staff(ev, self_mxid, is_staff, staff_store, pl_users)
+            for ev in results.get("state", []):
+                mask_event_dict_for_non_staff(ev, self_mxid, is_staff, staff_store, pl_users)
+
         return 200, results
 
 
@@ -1514,7 +1609,7 @@ class RoomMembershipRestServlet(TransactionRestServlet):
         target = requester.user
         if membership_action in ["invite", "ban", "unban", "kick"]:
             assert_params_in_dict(request_body, ["user_id"])
-            target = UserID.from_string(request_body["user_id"])
+            target = UserID.from_string(unmask_user_id(request_body["user_id"]))
 
         event_content = None
         if "reason" in request_body:

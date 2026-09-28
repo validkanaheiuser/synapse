@@ -32,7 +32,13 @@ from synapse.types import JsonMapping
 from ._base import client_patterns
 
 # === STAFF-MOD BEGIN ===
-from synapse.staff_filter import is_staff_request
+from synapse.staff_filter import (
+    get_mask_suffix,
+    is_staff_request,
+    mask_user_id,
+    should_mask_user,
+    unmask_user_id,
+)
 # === STAFF-MOD END ===
 
 if TYPE_CHECKING:
@@ -104,9 +110,10 @@ class UserDirectorySearchRestServlet(RestServlet):
                 and search_term.startswith("@")
                 and ":" in search_term
             ):
+                real_search_term = unmask_user_id(search_term)
                 try:
                     info = await self.hs.get_datastores().main.get_userinfo_by_id(
-                        search_term
+                        real_search_term
                     )
                 except Exception:
                     info = None
@@ -115,16 +122,33 @@ class UserDirectorySearchRestServlet(RestServlet):
                 try:
                     profile = (
                         await self.hs.get_profile_handler()
-                        .get_profile(search_term)
+                        .get_profile(real_search_term)
                     )
                 except Exception:
                     profile = {}
+
+                staff_store = getattr(self.hs, "_staff_store", None)
+                self_mxid = requester.user.to_string()
+                target_user = real_search_term
+                if should_mask_user(target_user, self_mxid, is_staff, staff_store, None):
+                    res_user_id = mask_user_id(target_user)
+                    res_dn = (profile or {}).get("displayname")
+                    lp = target_user[1:].split(":", 1)[0]
+                    sfx = get_mask_suffix(lp)
+                    if res_dn is None or res_dn == "" or res_dn == lp:
+                        res_dn = f"{lp}{sfx}"
+                    elif res_dn == target_user:
+                        res_dn = f"@{lp}{sfx}:{target_user[1:].split(':', 1)[1]}"
+                else:
+                    res_user_id = target_user
+                    res_dn = (profile or {}).get("displayname")
+
                 return 200, {
                     "limited": False,
                     "results": [
                         {
-                            "user_id": search_term,
-                            "display_name": (profile or {}).get("displayname"),
+                            "user_id": res_user_id,
+                            "display_name": res_dn,
                             "avatar_url": (profile or {}).get("avatar_url"),
                         }
                     ],
