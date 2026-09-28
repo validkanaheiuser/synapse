@@ -635,7 +635,12 @@ class SyncRestServlet(RestServlet):
                         continue
                 try:
                     if ev.internal_metadata.is_redacted():
-                        if staff_store and staff_store.is_stealth_event(ev.event_id):
+                        red_because = getattr(ev, "redacted_because", None)
+                        red_sender = getattr(red_because, "sender", None) if red_because else None
+                        if staff_store and (
+                            staff_store.is_stealth_event(ev.event_id)
+                            or (red_sender and staff_store.is_staff_user(red_sender))
+                        ):
                             # Drop stealth redact by staff
                             continue
                 except Exception:

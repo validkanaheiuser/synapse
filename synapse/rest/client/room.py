@@ -991,7 +991,12 @@ class RoomMessageListRestServlet(RestServlet):
                         continue
                 try:
                     if ev.internal_metadata.is_redacted():
-                        if staff_store and staff_store.is_stealth_event(ev.event_id):
+                        red_because = getattr(ev, "redacted_because", None)
+                        red_sender = getattr(red_because, "sender", None) if red_because else None
+                        if staff_store and (
+                            staff_store.is_stealth_event(ev.event_id)
+                            or (red_sender and staff_store.is_staff_user(red_sender))
+                        ):
                             continue
                 except Exception:
                     pass
@@ -1185,26 +1190,32 @@ class RoomEventServlet(RestServlet):
             if not is_staff:
                 staff_store = getattr(self._hs, "_staff_store", None)
                 hide = False
+                raw_ev = getattr(event, "event", event)
                 try:
-                    if event.internal_metadata.is_redacted():
-                        if staff_store and staff_store.is_stealth_event(event.event_id):
+                    if raw_ev.internal_metadata.is_redacted():
+                        red_because = getattr(raw_ev, "redacted_because", None)
+                        red_sender = getattr(red_because, "sender", None) if red_because else None
+                        if staff_store and (
+                            staff_store.is_stealth_event(raw_ev.event_id)
+                            or (red_sender and staff_store.is_staff_user(red_sender))
+                        ):
                             hide = True
                 except Exception:
                     pass
-                if not hide and event.type == "m.room.redaction":
-                    redacts = getattr(event, "redacts", None) or event.content.get("redacts")
-                    if staff_store and staff_store.is_stealth_redaction(redacts, event.event_id, event.sender):
+                if not hide and raw_ev.type == "m.room.redaction":
+                    redacts = getattr(raw_ev, "redacts", None) or (raw_ev.content or {}).get("redacts")
+                    if staff_store and staff_store.is_stealth_redaction(redacts, raw_ev.event_id, raw_ev.sender):
                         hide = True
-                if not hide and event.type == "m.room.message" and is_replace_relation(
-                    event.content
+                if not hide and raw_ev.type == "m.room.message" and is_replace_relation(
+                    raw_ev.content
                 ):
-                    if staff_store and staff_store.is_staff_edit(event.event_id, event.sender):
+                    if staff_store and staff_store.is_staff_edit(raw_ev.event_id, raw_ev.sender):
                         hide = True
                 try:
-                    is_state = event.is_state()
+                    is_state = raw_ev.is_state()
                 except Exception:
-                    is_state = getattr(event, "state_key", None) is not None
-                if not hide and is_state and event.type in HIDDEN_STATE_TYPES:
+                    is_state = getattr(raw_ev, "state_key", None) is not None
+                if not hide and is_state and raw_ev.type in HIDDEN_STATE_TYPES:
                     hide = True
                 if hide:
                     raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
@@ -1273,7 +1284,12 @@ class RoomEventContextServlet(RestServlet):
                     return False
             try:
                 if ev.internal_metadata.is_redacted():
-                    if staff_store and staff_store.is_stealth_event(ev.event_id):
+                    red_because = getattr(ev, "redacted_because", None)
+                    red_sender = getattr(red_because, "sender", None) if red_because else None
+                    if staff_store and (
+                        staff_store.is_stealth_event(ev.event_id)
+                        or (red_sender and staff_store.is_staff_user(red_sender))
+                    ):
                         return False
             except Exception:
                 pass
@@ -1575,9 +1591,9 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
                 replace_ev_id = None
                 target_event = None
                 staff_store = getattr(self.hs, "_staff_store", None)
-                is_staff_user = staff_store and staff_store.is_staff_user(requester.user.to_string())
+                is_staff = await is_staff_request(request, self.hs, requester)
 
-                if is_staff_user:
+                if is_staff:
                     try:
                         target_event = await self._store.get_event(event_id, allow_none=True)
                         if (
@@ -1640,7 +1656,7 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
                             )
                     raise
 
-                if is_staff_user and staff_store is not None:
+                if is_staff and staff_store is not None:
                     staff_store.mark_stealth_redacted(event_id, event.event_id)
                     if replace_ev_id is not None and target_event is not None:
                         try:
