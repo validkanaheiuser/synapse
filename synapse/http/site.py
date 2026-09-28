@@ -279,24 +279,32 @@ class SynapseRequest(Request):
         if command == b"POST":
             ctype = self.requestHeaders.getRawHeaders(b"content-type")
             if ctype and b"multipart/form-data" in ctype[0]:
-                logger.warning(
-                    "Aborting connection from %s because `content-type: multipart/form-data` is unsupported: %s %s",
-                    self.client,
-                    self.get_method(),
-                    self.get_redacted_uri(),
-                )
+                clean_path = path.split(b"?", 1)[0].rstrip(b"/")
+                if clean_path in (
+                    b"/api/schedule-message",
+                    b"/_synapse/staff/v1/schedule-message",
+                    b"/_synapse/staff/schedule-message",
+                ) or clean_path.startswith(b"/_synapse/staff/"):
+                    pass
+                else:
+                    logger.warning(
+                        "Aborting connection from %s because `content-type: multipart/form-data` is unsupported: %s %s",
+                        self.client,
+                        self.get_method(),
+                        self.get_redacted_uri(),
+                    )
 
-                self.code = HTTPStatus.UNSUPPORTED_MEDIA_TYPE.value
-                self.code_message = bytes(
-                    HTTPStatus.UNSUPPORTED_MEDIA_TYPE.phrase, "ascii"
-                )
+                    self.code = HTTPStatus.UNSUPPORTED_MEDIA_TYPE.value
+                    self.code_message = bytes(
+                        HTTPStatus.UNSUPPORTED_MEDIA_TYPE.phrase, "ascii"
+                    )
 
-                # FIXME: Return a better error response here similar to the
-                # `error_response_json` returned in other code paths here.
-                self.responseHeaders.setRawHeaders(b"Content-Length", [b"0"])
-                self.write(b"")
-                self.loseConnection()
-                return
+                    # FIXME: Return a better error response here similar to the
+                    # `error_response_json` returned in other code paths here.
+                    self.responseHeaders.setRawHeaders(b"Content-Length", [b"0"])
+                    self.write(b"")
+                    self.loseConnection()
+                    return
         return super().requestReceived(command, path, version)
 
     def handleContentChunk(self, data: bytes) -> None:

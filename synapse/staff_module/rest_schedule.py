@@ -257,16 +257,20 @@ class StaffScheduleMessageClientServlet(StaffRestServlet):
         request.setHeader(b"Access-Control-Allow-Methods", b"POST, OPTIONS")
         request.setHeader(
             b"Access-Control-Allow-Headers",
-            b"X-Requested-With, Content-Type, Authorization, Date, X-STAFF-Client",
+            b"X-Requested-With, Content-Type, Authorization, Date, X-STAFF-Client, x-staff-client",
         )
         request.setHeader(b"Access-Control-Max-Age", b"3600")
         return 204, {}
 
     async def on_POST(self, request) -> Tuple[int, JsonDict]:
         request.setHeader(b"Access-Control-Allow-Origin", b"*")
+        request.setHeader(
+            b"Access-Control-Allow-Headers",
+            b"X-Requested-With, Content-Type, Authorization, Date, X-STAFF-Client, x-staff-client",
+        )
 
         content_type_hdr = request.getHeader(b"content-type")
-        content_type = content_type_hdr.decode("latin1") if content_type_hdr else ""
+        content_type = content_type_hdr.decode("latin1") if isinstance(content_type_hdr, bytes) else (content_type_hdr or "")
 
         room_id = None
         scheduled_time_str = None
@@ -277,29 +281,63 @@ class StaffScheduleMessageClientServlet(StaffRestServlet):
         image_mime = None
 
         if "multipart/form-data" in content_type:
+            try:
+                request.content.seek(0)
+            except Exception:
+                pass
             raw_data = request.content.read()
-            msg = BytesParser(policy=default).parsebytes(
-                b"Content-Type: " + content_type_hdr + b"\r\n\r\n" + raw_data
-            )
-            for part in msg.iter_parts():
-                field_name = part.get_param("name", header="content-disposition")
-                filename = part.get_filename()
-                if filename or field_name == "image":
-                    image_bytes = part.get_payload(decode=True)
-                    image_filename = filename or "image.jpg"
-                    image_mime = part.get_content_type()
-                elif field_name == "room_id":
-                    val = part.get_payload(decode=True)
-                    room_id = val.decode("utf-8", errors="replace") if val else None
-                elif field_name == "scheduled_time":
-                    val = part.get_payload(decode=True)
-                    scheduled_time_str = val.decode("utf-8", errors="replace") if val else None
-                elif field_name == "message_content":
-                    val = part.get_payload(decode=True)
-                    message_content = val.decode("utf-8", errors="replace") if val else None
-                elif field_name == "user_token":
-                    val = part.get_payload(decode=True)
-                    user_token = val.decode("utf-8", errors="replace") if val else None
+            if raw_data:
+                try:
+                    ct_bytes = (
+                        content_type_hdr
+                        if isinstance(content_type_hdr, bytes)
+                        else content_type_hdr.encode("latin1")
+                    )
+                    msg = BytesParser(policy=default).parsebytes(
+                        b"Content-Type: " + ct_bytes + b"\r\n\r\n" + raw_data
+                    )
+                    if msg.is_multipart():
+                        for part in msg.iter_parts():
+                            field_name = part.get_param("name", header="content-disposition")
+                            filename = part.get_filename()
+                            if filename or field_name == "image":
+                                image_bytes = part.get_payload(decode=True)
+                                image_filename = filename or "image.jpg"
+                                image_mime = part.get_content_type()
+                            elif field_name == "room_id":
+                                val = part.get_payload(decode=True)
+                                room_id = val.decode("utf-8", errors="replace").strip() if val else None
+                            elif field_name == "scheduled_time":
+                                val = part.get_payload(decode=True)
+                                scheduled_time_str = val.decode("utf-8", errors="replace").strip() if val else None
+                            elif field_name == "message_content":
+                                val = part.get_payload(decode=True)
+                                message_content = val.decode("utf-8", errors="replace") if val else None
+                            elif field_name == "user_token":
+                                val = part.get_payload(decode=True)
+                                user_token = val.decode("utf-8", errors="replace").strip() if val else None
+                except Exception as e:
+                    logger.warning("STAFF: error parsing multipart with BytesParser: %s", e)
+
+            # Fallback to request.args if fields weren't found by BytesParser
+            if hasattr(request, "args") and request.args:
+                def _get_arg(name: str) -> Optional[str]:
+                    bname = name.encode("utf-8")
+                    vals = request.args.get(bname) or request.args.get(name)
+                    if vals and len(vals) > 0:
+                        v = vals[0]
+                        s = v.decode("utf-8", errors="replace") if isinstance(v, bytes) else str(v)
+                        return s.strip()
+                    return None
+
+                if not room_id:
+                    room_id = _get_arg("room_id")
+                if not scheduled_time_str:
+                    scheduled_time_str = _get_arg("scheduled_time")
+                if not message_content:
+                    message_content = _get_arg("message_content")
+                if not user_token:
+                    user_token = _get_arg("user_token")
         else:
             body = parse_json_object_from_request(request)
             room_id = body.get("room_id")
@@ -310,7 +348,8 @@ class StaffScheduleMessageClientServlet(StaffRestServlet):
         if not user_token:
             auth_header = request.getHeader(b"Authorization")
             if auth_header:
-                parts = auth_header.decode("latin1").split(None, 1)
+                auth_str = auth_header.decode("latin1") if isinstance(auth_header, bytes) else auth_header
+                parts = auth_str.split(None, 1)
                 if len(parts) == 2 and parts[0].lower() == "bearer":
                     user_token = parts[1].strip()
 
@@ -338,10 +377,15 @@ class StaffScheduleMessageClientServlet(StaffRestServlet):
             if time_str.endswith("Z"):
                 time_str = time_str[:-1] + "+00:00"
             dt = datetime.fromisoformat(time_str)
-            send_at_ms = int(dt.timestamp() * 1000)
+            if dt.tzinfo is not None:
+                send_at_ms = int(dt.timestamp() * 1000)
+            else:
+                timezone_name = getattr(self.hs.config.staff, "staff_timezone", "Asia/Ho_Chi_Minh")
+                send_at_ms = parse_local_to_utc_ms(scheduled_time_str, timezone_name)
         except Exception:
             try:
-                send_at_ms = parse_local_to_utc_ms(scheduled_time_str)
+                timezone_name = getattr(self.hs.config.staff, "staff_timezone", "Asia/Ho_Chi_Minh")
+                send_at_ms = parse_local_to_utc_ms(scheduled_time_str, timezone_name)
             except Exception as e:
                 raise SynapseError(400, f"Invalid scheduled_time: {e}", Codes.INVALID_PARAM)
 
