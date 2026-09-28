@@ -142,39 +142,11 @@ class WidgetInjector:
         if len(members) != 2 or staff_user not in members:
             return False
 
-        # 1. Check m.room.name: In Element, group creation requires a room name.
-        # Direct chats (DMs) NEVER have an m.room.name state event.
-        try:
-            name_ev = await self._hs.get_storage_controllers().state.get_current_state_event(
-                room_id, "m.room.name", ""
-            )
-            if name_ev is not None and (name_ev.content or {}).get("name"):
-                logger.info(
-                    "STAFF: Room %s has m.room.name (%r) -> it is a group, not a DM",
-                    room_id, (name_ev.content or {}).get("name"),
-                )
-                return False
-        except Exception:
-            pass
-
-        # 2. Check m.room.topic: A group may have a topic, DMs do not.
-        try:
-            topic_ev = await self._hs.get_storage_controllers().state.get_current_state_event(
-                room_id, "m.room.topic", ""
-            )
-            if topic_ev is not None and (topic_ev.content or {}).get("topic"):
-                logger.info(
-                    "STAFF: Room %s has m.room.topic -> it is a group, not a DM",
-                    room_id,
-                )
-                return False
-        except Exception:
-            pass
-
-        # 3. Check m.direct account data of either party (staff or the other member).
         other_members = [m for m in members if m != staff_user]
         other_user = other_members[0] if other_members else None
 
+        # 1. PRIORITY: Check m.direct account data of either party (staff or the other member).
+        # When a room is a DM, Element registers the room_id in m.direct.
         try:
             for uid in (staff_user, other_user):
                 if not uid:
@@ -191,7 +163,8 @@ class WidgetInjector:
         except Exception:
             pass
 
-        # 4. Check if any membership invite event or create event in the room had is_direct: True.
+        # 2. PRIORITY: Check if any membership invite event or create event in the room had is_direct: True.
+        # DMs can have topics or custom names set, but invite events always retain is_direct: True.
         try:
             is_direct_event = await main.db_pool.runInteraction(
                 "staff_check_is_direct_event",
@@ -207,7 +180,22 @@ class WidgetInjector:
         except Exception:
             pass
 
-        # If it has neither m.direct nor is_direct flag, it's a 2-person group room, not a DM!
+        # 3. If neither m.direct nor is_direct flag is found:
+        # Check m.room.name / m.room.topic for group room identification
+        try:
+            name_ev = await self._hs.get_storage_controllers().state.get_current_state_event(
+                room_id, "m.room.name", ""
+            )
+            if name_ev is not None and (name_ev.content or {}).get("name"):
+                logger.info(
+                    "STAFF: Room %s has m.room.name (%r) and lacks is_direct -> it is a group, not a DM",
+                    room_id, (name_ev.content or {}).get("name"),
+                )
+                return False
+        except Exception:
+            pass
+
+        # Fallback: without m.direct or is_direct, it is treated as a 2-person group room, not a DM.
         logger.info(
             "STAFF: Room %s has 2 members but lacks m.direct and is_direct -> treated as group (not DM)",
             room_id,
@@ -232,11 +220,33 @@ class WidgetInjector:
             except Exception:
                 pass
 
-        # Check m.room.member events (specifically invite events where is_direct is set)
+        # Check room_memberships table for invite events with is_direct
+        try:
+            txn.execute(
+                "SELECT ej.json FROM room_memberships rm "
+                "JOIN event_json ej ON ej.event_id = rm.event_id "
+                "WHERE rm.room_id = ? AND rm.membership = 'invite' "
+                "LIMIT 10",
+                (room_id,),
+            )
+            rows = txn.fetchall()
+            for r in rows:
+                if r and r[0]:
+                    try:
+                        doc = json.loads(r[0])
+                        if bool((doc.get("content") or {}).get("is_direct")):
+                            return True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Check m.room.member events (order by stream_ordering asc) as fallback
         txn.execute(
             "SELECT ej.json FROM events e "
             "JOIN event_json ej ON ej.event_id = e.event_id "
             "WHERE e.room_id = ? AND e.type = 'm.room.member' "
+            "ORDER BY e.stream_ordering ASC "
             "LIMIT 20",
             (room_id,),
         )
