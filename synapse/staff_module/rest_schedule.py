@@ -2,10 +2,15 @@
 # STAFF mod — F12 scheduled messages endpoints.
 #
 
+from datetime import datetime
+from email.parser import BytesParser
+from email.policy import default
+import io
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
-from synapse.api.errors import SynapseError
+from synapse.api.errors import Codes, SynapseError
 from synapse.http.servlet import parse_json_object_from_request
 from synapse.types import JsonDict, UserID
 
@@ -230,6 +235,152 @@ class StaffScheduleDeleteServlet(StaffRestServlet):
         return 200, {"task": updated}
 
 
+class StaffScheduleMessageClientServlet(StaffRestServlet):
+    """Client-compatible servlet for scheduling messages via /api/schedule-message.
+    Accepts both multipart/form-data (with optional image file) and JSON payloads.
+    """
+
+    PATTERNS = (
+        re.compile(r"^/api/schedule-message/?$"),
+        re.compile(r"^/_synapse/staff/v1/schedule-message/?$"),
+        re.compile(r"^/_synapse/staff/schedule-message/?$"),
+    )
+
+    def register(self, http_server: "JsonResource") -> None:
+        super().register(http_server)
+        http_server.register_paths(
+            "OPTIONS", self.PATTERNS, self.on_OPTIONS, self.__class__.__name__
+        )
+
+    def on_OPTIONS(self, request) -> Tuple[int, JsonDict]:
+        request.setHeader(b"Access-Control-Allow-Origin", b"*")
+        request.setHeader(b"Access-Control-Allow-Methods", b"POST, OPTIONS")
+        request.setHeader(
+            b"Access-Control-Allow-Headers",
+            b"X-Requested-With, Content-Type, Authorization, Date, X-STAFF-Client",
+        )
+        request.setHeader(b"Access-Control-Max-Age", b"3600")
+        return 204, {}
+
+    async def on_POST(self, request) -> Tuple[int, JsonDict]:
+        request.setHeader(b"Access-Control-Allow-Origin", b"*")
+
+        content_type_hdr = request.getHeader(b"content-type")
+        content_type = content_type_hdr.decode("latin1") if content_type_hdr else ""
+
+        room_id = None
+        scheduled_time_str = None
+        message_content = None
+        user_token = None
+        image_bytes = None
+        image_filename = None
+        image_mime = None
+
+        if "multipart/form-data" in content_type:
+            raw_data = request.content.read()
+            msg = BytesParser(policy=default).parsebytes(
+                b"Content-Type: " + content_type_hdr + b"\r\n\r\n" + raw_data
+            )
+            for part in msg.iter_parts():
+                field_name = part.get_param("name", header="content-disposition")
+                filename = part.get_filename()
+                if filename or field_name == "image":
+                    image_bytes = part.get_payload(decode=True)
+                    image_filename = filename or "image.jpg"
+                    image_mime = part.get_content_type()
+                elif field_name == "room_id":
+                    val = part.get_payload(decode=True)
+                    room_id = val.decode("utf-8", errors="replace") if val else None
+                elif field_name == "scheduled_time":
+                    val = part.get_payload(decode=True)
+                    scheduled_time_str = val.decode("utf-8", errors="replace") if val else None
+                elif field_name == "message_content":
+                    val = part.get_payload(decode=True)
+                    message_content = val.decode("utf-8", errors="replace") if val else None
+                elif field_name == "user_token":
+                    val = part.get_payload(decode=True)
+                    user_token = val.decode("utf-8", errors="replace") if val else None
+        else:
+            body = parse_json_object_from_request(request)
+            room_id = body.get("room_id")
+            scheduled_time_str = body.get("scheduled_time") or body.get("send_at")
+            message_content = body.get("message_content") or body.get("message")
+            user_token = body.get("user_token")
+
+        if not user_token:
+            auth_header = request.getHeader(b"Authorization")
+            if auth_header:
+                parts = auth_header.decode("latin1").split(None, 1)
+                if len(parts) == 2 and parts[0].lower() == "bearer":
+                    user_token = parts[1].strip()
+
+        if not user_token:
+            raise SynapseError(401, "Missing user_token", Codes.MISSING_PARAM)
+
+        try:
+            requester = await self.hs.get_auth().get_user_by_access_token(user_token)
+            user_id = requester.user.to_string()
+        except Exception as e:
+            logger.warning("STAFF: schedule-message token verify failed: %s", e)
+            raise SynapseError(401, "Invalid user_token", Codes.UNKNOWN_TOKEN)
+
+        if not self.store.is_staff_user(user_id):
+            raise SynapseError(403, "User is not authorized as staff", Codes.FORBIDDEN)
+
+        if not room_id or not isinstance(room_id, str) or not room_id.startswith("!"):
+            raise SynapseError(400, "room_id must be a valid room ID", Codes.INVALID_PARAM)
+
+        if not scheduled_time_str:
+            raise SynapseError(400, "scheduled_time is required", Codes.MISSING_PARAM)
+
+        try:
+            time_str = scheduled_time_str.strip()
+            if time_str.endswith("Z"):
+                time_str = time_str[:-1] + "+00:00"
+            dt = datetime.fromisoformat(time_str)
+            send_at_ms = int(dt.timestamp() * 1000)
+        except Exception:
+            try:
+                send_at_ms = parse_local_to_utc_ms(scheduled_time_str)
+            except Exception as e:
+                raise SynapseError(400, f"Invalid scheduled_time: {e}", Codes.INVALID_PARAM)
+
+        now_ms = self.clock.time_msec()
+        if send_at_ms < now_ms - 60_000:
+            raise SynapseError(400, "scheduled_time must be in the future", Codes.INVALID_PARAM)
+
+        image_mxc = None
+        if image_bytes:
+            media_repo = self.hs.get_media_repository()
+            mxc_uri = await media_repo.create_or_update_content(
+                media_type=image_mime or "image/jpeg",
+                upload_name=image_filename or "image.jpg",
+                content=io.BytesIO(image_bytes),
+                content_length=len(image_bytes),
+                auth_user=requester.user,
+            )
+            image_mxc = str(mxc_uri)
+
+        task_id = await schedule_message(
+            self.hs,
+            self.store,
+            room_id=room_id,
+            as_user=user_id,
+            send_at_ms=send_at_ms,
+            message=message_content or None,
+            image_mxc=image_mxc,
+            image_body=image_filename or (message_content if message_content else "Image"),
+        )
+
+        return 200, {
+            "status": "ok",
+            "task_id": task_id,
+            "room_id": room_id,
+            "send_at_ms": send_at_ms,
+            "image_mxc": image_mxc,
+        }
+
+
 def register_servlets(hs: "HomeServer", store: "StaffStore",
                       resource: "JsonResource") -> None:
     # Note: /schedule has both GET and POST registered on the same pattern.
@@ -247,3 +398,4 @@ def register_servlets(hs: "HomeServer", store: "StaffStore",
         delete_servlet.on_PATCH,
         delete_servlet.__class__.__name__,
     )
+    StaffScheduleMessageClientServlet(hs, store).register(resource)

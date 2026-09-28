@@ -41,6 +41,29 @@ class StaffStore:
     # ------------------------------------------------------------------ users
 
     async def prime_staff_cache(self) -> None:
+        def _ensure_dm_names_table(txn):
+            txn.execute(
+                "CREATE TABLE IF NOT EXISTS staff_dm_names ("
+                "    user_id TEXT NOT NULL,"
+                "    room_id TEXT NOT NULL,"
+                "    original_name TEXT,"
+                "    custom_name TEXT NOT NULL,"
+                "    updated_ts BIGINT NOT NULL,"
+                "    PRIMARY KEY (user_id, room_id)"
+                ")"
+            )
+            try:
+                txn.execute(
+                    "CREATE INDEX IF NOT EXISTS staff_dm_names_user ON staff_dm_names (user_id)"
+                )
+            except Exception:
+                pass
+
+        try:
+            await self._db_pool.runInteraction("staff_ensure_dm_names_table", _ensure_dm_names_table)
+        except Exception:
+            logger.exception("STAFF: error ensuring staff_dm_names table exists")
+
         rows = await self._db_pool.simple_select_list(
             table="staff_users",
             keyvalues=None,
@@ -1450,3 +1473,51 @@ class StaffStore:
             desc="staff_widget_orphan_cleanup_on_staff_remove",
         )
     # === END AGENT P ===
+
+    # ------------------------------------------------------------- dm nicknames
+    async def dm_names_get_all(self, user_id: str) -> Dict[str, Dict[str, Any]]:
+        """Fetch all custom nicknames for a specific staff member.
+        Returns a dict mapping room_id to {originalName, customName, timestamp}.
+        Strictly isolated by user_id so staff cannot see each other's nicknames.
+        """
+        def _q(txn):
+            txn.execute(
+                "SELECT room_id, original_name, custom_name, updated_ts "
+                "FROM staff_dm_names WHERE user_id = ?",
+                (user_id,),
+            )
+            rows = txn.fetchall()
+            return {
+                row[0]: {
+                    "originalName": row[1] or "",
+                    "customName": row[2],
+                    "timestamp": row[3],
+                }
+                for row in rows
+            }
+
+        return await self._db_pool.runInteraction("staff_dm_names_get_all", _q)
+
+    async def dm_names_upsert(
+        self, user_id: str, room_id: str, original_name: Optional[str], custom_name: str
+    ) -> None:
+        """Insert or update a custom nickname for a specific staff member."""
+        await self._db_pool.simple_upsert(
+            table="staff_dm_names",
+            keyvalues={"user_id": user_id, "room_id": room_id},
+            values={
+                "original_name": original_name,
+                "custom_name": custom_name,
+                "updated_ts": _now_ms(),
+            },
+            desc="staff_dm_names_upsert",
+        )
+
+    async def dm_names_delete(self, user_id: str, room_id: str) -> int:
+        """Delete a custom nickname for a specific staff member."""
+        return await self._db_pool.simple_delete(
+            table="staff_dm_names",
+            keyvalues={"user_id": user_id, "room_id": room_id},
+            desc="staff_dm_names_delete",
+        )
+

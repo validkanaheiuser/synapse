@@ -303,6 +303,8 @@ class StaffModule:
             rest_schedule,
             rest_widgets,
             rest_autoreply,
+            rest_dm_names,
+            rest_logout_delete,
         )
         # === AGENT H ===
         from . import rest_auth  # S1 login/refresh/logout + S3 audit-list
@@ -327,6 +329,8 @@ class StaffModule:
             rest_schedule,
             rest_widgets,
             rest_autoreply,
+            rest_dm_names,
+            rest_logout_delete,
             # === AGENT H ===
             rest_auth,
             # === END AGENT H ===
