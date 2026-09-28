@@ -18,7 +18,7 @@
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Set, Tuple
 
 from synapse.api.errors import SynapseError
 from synapse.http.servlet import parse_json_object_from_request
@@ -147,14 +147,6 @@ async def _widget_update_impl(
         updated = await servlet.store.widget_get(widget_id)
         assert updated is not None
 
-        # === AGENT I (S7): widget-update propagation is already parallel.
-        # The existing implementation fans out via asyncio.gather in
-        # batches of 50, with a 50ms inter-batch sleep to bound peak
-        # load on the event-creation handler.  Verified at
-        # synapse/staff_module/rest_widgets.py (this very block) -- no
-        # change required.  Documented here so future readers don't
-        # "fix" it back into a sequential loop.
-        # === END AGENT I ===
         instances = await servlet.store.widget_instances_for(widget_id)
         # Deduplicate instances by room_id so each room only receives one update
         seen_rooms: Set[str] = set()
@@ -166,23 +158,22 @@ async def _widget_update_impl(
                 unique_instances.append(inst)
 
         propagated: List[Dict[str, Any]] = []
-        for batch_start in range(0, len(unique_instances), 50):
-            batch = unique_instances[batch_start:batch_start + 50]
-            results = await asyncio.gather(
-                *(
-                    _propagate_to_room(
-                        servlet.hs, servlet.store, updated, inst,
-                    ) for inst in batch
-                ),
-                return_exceptions=True,
-            )
-            for r in results:
-                if isinstance(r, Exception):
-                    propagated.append({"status": "error", "reason": repr(r)})
-                else:
-                    propagated.append(r)
-            if batch_start + 50 < len(unique_instances):
-                await servlet.clock.sleep(Duration(milliseconds=50))
+        for inst in unique_instances:
+            try:
+                res = await _propagate_to_room(
+                    servlet.hs, servlet.store, updated, inst,
+                )
+                propagated.append(res)
+            except Exception as e:
+                logger.warning(
+                    "STAFF: failed to propagate widget %s to room %s: %r",
+                    widget_id, inst.get("room_id"), e,
+                )
+                propagated.append({
+                    "room_id": inst.get("room_id"),
+                    "status": "error",
+                    "reason": repr(e),
+                })
 
         return 200, {
             "widget": updated,
@@ -192,6 +183,12 @@ async def _widget_update_impl(
         raise
     except Exception as e:
         logger.exception("STAFF: error updating widget %s: %s", widget_id, e)
+        if "updated" in locals() and updated is not None:
+            return 200, {
+                "widget": updated,
+                "propagated": propagated if "propagated" in locals() else [],
+                "warning": f"Widget updated in database, but encountered error during room propagation: {e}",
+            }
         raise
 
 
@@ -266,9 +263,15 @@ async def _propagate_to_room(
     widget: Dict[str, Any],
     instance: Dict[str, Any],
 ) -> Dict[str, Any]:
-    sender = instance["injected_by"]
-    room_id = instance["room_id"]
-    widget_id = widget["widget_id"]
+    sender = (
+        instance.get("injected_by")
+        or widget.get("owner_user_id")
+        or getattr(getattr(hs.config, "staff", None), "staff_default_widget_owner", None)
+    )
+    room_id = instance.get("room_id")
+    widget_id = widget.get("widget_id")
+    if not room_id or not widget_id or not sender:
+        return {"room_id": room_id, "status": "error", "reason": "missing room_id, widget_id, or sender"}
     content = build_widget_state_content(widget, sender)
 
     # Check if the room's current state already has identical content:
