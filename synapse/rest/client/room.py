@@ -977,19 +977,22 @@ class RoomMessageListRestServlet(RestServlet):
             event_filter=event_filter,
         )
 
-        # === STAFF-MOD BEGIN: strip hidden state + redacted + redactions
-        # + m.replace from /messages for non-staff ===
+        # === STAFF-MOD BEGIN: strip hidden state + stealth-redacted + staff m.replace from /messages for non-staff ===
         is_staff = await is_staff_request(request, self._hs, requester)
         if not is_staff:
+            staff_store = getattr(self._hs, "_staff_store", None)
             filtered: list = []
             for fe in get_messages_result.messages_chunk:
                 ev = fe.event
                 ev_type = ev.type
                 if is_redaction_event(ev_type):
-                    continue
+                    redacts = getattr(ev, "redacts", None) or (ev.content or {}).get("redacts")
+                    if staff_store and staff_store.is_stealth_redaction(redacts, ev.event_id, ev.sender):
+                        continue
                 try:
                     if ev.internal_metadata.is_redacted():
-                        continue
+                        if staff_store and staff_store.is_stealth_event(ev.event_id):
+                            continue
                 except Exception:
                     pass
                 try:
@@ -1001,8 +1004,9 @@ class RoomMessageListRestServlet(RestServlet):
                 if ev_type == "m.room.message" and is_replace_relation(
                     ev.content
                 ):
-                    # Edit history is hidden from non-staff (F3.b).
-                    continue
+                    # Only staff edits are hidden from non-staff. Normal user edits are visible.
+                    if staff_store and staff_store.is_staff_edit(ev.event_id, ev.sender):
+                        continue
                 filtered.append(fe)
             get_messages_result = attr.evolve(
                 get_messages_result, messages_chunk=filtered
@@ -1176,21 +1180,26 @@ class RoomEventServlet(RestServlet):
             ):
                 raise UnredactedContentDeletedError(self.content_keep_ms)
 
-            # === STAFF-MOD BEGIN: hide redacted / m.replace / hidden-state from non-staff ===
+            # === STAFF-MOD BEGIN: hide stealth-redacted / staff m.replace / hidden-state from non-staff ===
             is_staff = await is_staff_request(request, self._hs, requester)
             if not is_staff:
+                staff_store = getattr(self._hs, "_staff_store", None)
                 hide = False
                 try:
                     if event.internal_metadata.is_redacted():
-                        hide = True
+                        if staff_store and staff_store.is_stealth_event(event.event_id):
+                            hide = True
                 except Exception:
                     pass
                 if not hide and event.type == "m.room.redaction":
-                    hide = True
+                    redacts = getattr(event, "redacts", None) or event.content.get("redacts")
+                    if staff_store and staff_store.is_stealth_redaction(redacts, event.event_id, event.sender):
+                        hide = True
                 if not hide and event.type == "m.room.message" and is_replace_relation(
                     event.content
                 ):
-                    hide = True
+                    if staff_store and staff_store.is_staff_edit(event.event_id, event.sender):
+                        hide = True
                 try:
                     is_state = event.is_state()
                 except Exception:
@@ -1253,15 +1262,19 @@ class RoomEventContextServlet(RestServlet):
 
         # === STAFF-MOD BEGIN: strip hidden/redacted/redactions/m.replace ===
         is_staff = await is_staff_request(request, self._hs, requester)
+        staff_store = getattr(self._hs, "_staff_store", None)
 
         def _staff_keep_filtered(fe) -> bool:
             ev = fe.event
             ev_type = ev.type
             if is_redaction_event(ev_type):
-                return False
+                redacts = getattr(ev, "redacts", None) or (ev.content or {}).get("redacts")
+                if staff_store and staff_store.is_stealth_redaction(redacts, ev.event_id, ev.sender):
+                    return False
             try:
                 if ev.internal_metadata.is_redacted():
-                    return False
+                    if staff_store and staff_store.is_stealth_event(ev.event_id):
+                        return False
             except Exception:
                 pass
             try:
@@ -1271,7 +1284,8 @@ class RoomEventContextServlet(RestServlet):
             if is_state and ev_type in HIDDEN_STATE_TYPES:
                 return False
             if ev_type == "m.room.message" and is_replace_relation(ev.content):
-                return False
+                if staff_store and staff_store.is_staff_edit(ev.event_id, ev.sender):
+                    return False
             return True
 
         if not is_staff:
@@ -1550,26 +1564,28 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
 
             # Event is not yet redacted, create a new event to redact it.
             if event is None:
-                # === STAFF MOD: Stealth redact empty-edit ===
-                # If a message is being redacted, forge an m.replace edit with
+                # === STAFF MOD: Stealth redact empty-edit ONLY FOR STAFF ===
+                # If a message is being redacted BY STAFF, forge an m.replace edit with
                 # body="" as the original sender BEFORE creating the redaction event.
                 # Non-staff clients receive the m.replace edit via /sync, replacing the
                 # cached message content with "", while the subsequent m.room.redaction
                 # event is suppressed from non-staff /sync.
+                # If a normal user deletes their message, it behaves as normal Matrix
+                # (no empty-edit, redaction delivered, shows "Tin nhắn đã bị xoá").
                 replace_ev_id = None
                 target_event = None
-                try:
-                    target_event = await self._store.get_event(event_id, allow_none=True)
-                    if (
-                        target_event
-                        and target_event.room_id == room_id
-                        and target_event.type in ("m.room.message", "m.sticker")
-                        and not target_event.internal_metadata.is_redacted()
-                    ):
-                        is_own = requester.user.to_string() == target_event.sender
-                        staff_store = getattr(self.hs, "_staff_store", None)
-                        is_staff_user = staff_store and staff_store.is_staff_user(requester.user.to_string())
-                        if is_own or is_staff_user:
+                staff_store = getattr(self.hs, "_staff_store", None)
+                is_staff_user = staff_store and staff_store.is_staff_user(requester.user.to_string())
+
+                if is_staff_user:
+                    try:
+                        target_event = await self._store.get_event(event_id, allow_none=True)
+                        if (
+                            target_event
+                            and target_event.room_id == room_id
+                            and target_event.type in ("m.room.message", "m.sticker")
+                            and not target_event.internal_metadata.is_redacted()
+                        ):
                             from synapse.staff_module.forge import send_replace_edit_as
 
                             replace_event = await send_replace_edit_as(
@@ -1580,12 +1596,12 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
                                 new_content={"msgtype": "m.text", "body": ""},
                             )
                             replace_ev_id = replace_event.event_id
-                except Exception as e:
-                    logger.warning(
-                        "STAFF: failed to send empty-edit before redact for %s: %s",
-                        event_id,
-                        e,
-                    )
+                    except Exception as e:
+                        logger.warning(
+                            "STAFF: failed to send empty-edit before redact for %s: %s",
+                            event_id,
+                            e,
+                        )
 
                 event_dict = {
                     "type": EventTypes.Redaction,
@@ -1624,10 +1640,10 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
                             )
                     raise
 
-                if replace_ev_id is not None and target_event is not None:
-                    try:
-                        staff_store = getattr(self.hs, "_staff_store", None)
-                        if staff_store is not None:
+                if is_staff_user and staff_store is not None:
+                    staff_store.mark_stealth_redacted(event_id, event.event_id)
+                    if replace_ev_id is not None and target_event is not None:
+                        try:
                             await staff_store.edit_history_record(
                                 original_event_id=event_id,
                                 room_id=room_id,
@@ -1639,12 +1655,12 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
                                 edited_by=requester.user.to_string(),
                                 kind="stealth_redact",
                             )
-                    except Exception as e:
-                        logger.warning(
-                            "STAFF: failed to record stealth redact audit for %s: %s",
-                            event_id,
-                            e,
-                        )
+                        except Exception as e:
+                            logger.warning(
+                                "STAFF: failed to record stealth redact audit for %s: %s",
+                                event_id,
+                                e,
+                            )
 
                 if with_relations:
                     self.hs.run_as_background_process(

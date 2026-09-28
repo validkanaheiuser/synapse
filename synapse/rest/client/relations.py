@@ -98,20 +98,28 @@ class RelationPaginationServlet(RestServlet):
         # === STAFF-MOD BEGIN: hide edit history + redacted children from non-staff ===
         is_staff = await is_staff_request(request, self._hs, requester)
         if not is_staff:
+            staff_store = getattr(self._hs, "_staff_store", None)
             chunk = result.get("chunk", [])
             kept = []
             for ev in chunk:
                 rel = (ev.get("content") or {}).get("m.relates_to") or {}
                 if rel.get("rel_type") == "m.replace":
-                    continue
+                    # Only hide if it was a STAFF edit! Normal user edit history remains visible.
+                    ev_sender = ev.get("sender")
+                    ev_id = ev.get("event_id")
+                    if staff_store and staff_store.is_staff_edit(replace_event_id=ev_id, sender=ev_sender):
+                        continue
                 if (ev.get("unsigned") or {}).get("redacted_because"):
-                    continue
+                    red_because = (ev.get("unsigned") or {}).get("redacted_because") or {}
+                    red_sender = red_because.get("sender")
+                    if staff_store and staff_store.is_stealth_redaction(ev.get("event_id"), red_because.get("event_id"), red_sender):
+                        continue
                 kept.append(ev)
             result["chunk"] = kept
-            # Empty out the pagination tokens so clients don't keep paging
-            # through nothing.
-            result["next_batch"] = None
-            result["prev_batch"] = None
+            # Empty out the pagination tokens only if no relations were kept.
+            if not kept:
+                result["next_batch"] = None
+                result["prev_batch"] = None
         # === STAFF-MOD END ===
 
         return 200, result

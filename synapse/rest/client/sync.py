@@ -620,22 +620,24 @@ class SyncRestServlet(RestServlet):
         # from the timeline (F2 stealth-redact: client never knows a
         # redaction happened; the m.replace empty-edit that preceded the
         # redaction has already blanked the content client-side).
+        # Normal user redactions are preserved so client displays "Tin nhắn đã bị xoá".
         if not is_staff:
             kept: list = []
             relocated: list = []
+            staff_store = getattr(self.hs, "_staff_store", None)
             for fe in timeline_events:
                 ev = fe.event
                 ev_type = ev.type
                 if is_redaction_event(ev_type):
-                    # Drop entirely — see F2 in STAFF_MOD_PLAN.md.
-                    continue
+                    redacts = getattr(ev, "redacts", None) or (ev.content or {}).get("redacts")
+                    if staff_store and staff_store.is_stealth_redaction(redacts, ev.event_id, ev.sender):
+                        # Drop stealth redact by staff
+                        continue
                 try:
                     if ev.internal_metadata.is_redacted():
-                        # Server-side-redacted event.  Don't deliver to
-                        # non-staff in /sync — the empty-edit (F2) has
-                        # already blanked the content on cached clients,
-                        # and fresh syncs simply skip the message.
-                        continue
+                        if staff_store and staff_store.is_stealth_event(ev.event_id):
+                            # Drop stealth redact by staff
+                            continue
                 except Exception:
                     pass
                 # NOTE: m.replace edit events DO flow to non-staff via /sync

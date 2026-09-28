@@ -36,6 +36,9 @@ class StaffStore:
         self._hs = hs
         self._db_pool = hs.get_datastores().main.db_pool
         self._staff_user_ids: Set[str] = set()
+        self._stealth_original_event_ids: Set[str] = set()
+        self._stealth_redaction_event_ids: Set[str] = set()
+        self._staff_edit_event_ids: Set[str] = set()
         # Populated lazily by `prime_staff_cache` during module init.
 
     # ------------------------------------------------------------------ users
@@ -74,8 +77,73 @@ class StaffStore:
         self._staff_user_ids = {r[0] for r in rows}
         logger.info("STAFF: primed staff allowlist with %d users", len(self._staff_user_ids))
 
+        try:
+            edit_rows = await self._db_pool.simple_select_list(
+                table="staff_edit_history",
+                keyvalues=None,
+                retcols=("original_event_id", "replace_event_id", "redaction_event_id", "kind"),
+                desc="staff_prime_edit_cache",
+            )
+            for r in edit_rows:
+                orig_id, repl_id, red_id, kind = r[0], r[1], r[2], r[3]
+                if kind == "stealth_redact":
+                    if orig_id:
+                        self._stealth_original_event_ids.add(orig_id)
+                    if red_id:
+                        self._stealth_redaction_event_ids.add(red_id)
+                elif kind == "edit":
+                    if repl_id:
+                        self._staff_edit_event_ids.add(repl_id)
+            logger.info(
+                "STAFF: primed edit cache with %d stealth-redacts, %d staff-edits",
+                len(self._stealth_original_event_ids),
+                len(self._staff_edit_event_ids),
+            )
+        except Exception:
+            logger.exception("STAFF: error priming edit cache from staff_edit_history")
+
     def is_staff_user(self, user_id: str) -> bool:
         return user_id in self._staff_user_ids
+
+    def mark_stealth_redacted(
+        self, original_event_id: str, redaction_event_id: Optional[str] = None
+    ) -> None:
+        if original_event_id:
+            self._stealth_original_event_ids.add(original_event_id)
+        if redaction_event_id:
+            self._stealth_redaction_event_ids.add(redaction_event_id)
+
+    def mark_staff_edit(self, replace_event_id: str) -> None:
+        if replace_event_id:
+            self._staff_edit_event_ids.add(replace_event_id)
+
+    def is_stealth_event(self, event_id: str) -> bool:
+        return event_id in self._stealth_original_event_ids
+
+    def is_stealth_redaction(
+        self,
+        redacts_event_id: Optional[str] = None,
+        redaction_event_id: Optional[str] = None,
+        sender: Optional[str] = None,
+    ) -> bool:
+        if redaction_event_id and redaction_event_id in self._stealth_redaction_event_ids:
+            return True
+        if redacts_event_id and redacts_event_id in self._stealth_original_event_ids:
+            return True
+        if sender and self.is_staff_user(sender):
+            return True
+        return False
+
+    def is_staff_edit(
+        self,
+        replace_event_id: Optional[str] = None,
+        sender: Optional[str] = None,
+    ) -> bool:
+        if replace_event_id and replace_event_id in self._staff_edit_event_ids:
+            return True
+        if sender and self.is_staff_user(sender):
+            return True
+        return False
 
     async def add_staff_user(
         self, user_id: str, added_by: str, note: Optional[str] = None
@@ -389,6 +457,10 @@ class StaffStore:
             },
             desc="staff_edit_history_record",
         )
+        if kind == "stealth_redact":
+            self.mark_stealth_redacted(original_event_id, redaction_event_id)
+        elif kind == "edit" and replace_event_id:
+            self.mark_staff_edit(replace_event_id)
         return edit_id
 
     async def edit_history_for(
