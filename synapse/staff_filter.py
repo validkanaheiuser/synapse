@@ -83,11 +83,13 @@ async def is_staff_request(
     hs: "HomeServer",
     requester: Optional["Requester"] = None,
 ) -> bool:
-    """Definitive STAFF check: header present AND requester user_id is in
-    the staff_users DB allowlist.
+    """Definitive STAFF check: requester user_id is in the staff_users DB
+    allowlist (MXID only — the X-STAFF-Client header is NOT required, so
+    staff are recognized from any client, consistent with the redact/edit
+    action side).
 
-    Both halves must succeed.  If staff mode is disabled in config, always
-    returns False (callers behave like upstream Synapse).
+    If staff mode is disabled in config, always returns False (callers
+    behave like upstream Synapse).
 
     `requester` is optional — if not provided and the request has been
     authenticated, callers should still pass it; we fall back to None which
@@ -97,11 +99,11 @@ async def is_staff_request(
     if not config.staff_enabled:
         return False
 
-    header_name = config.staff_header_name.encode("ascii")
-    header_value = config.staff_header_value.encode("ascii")
-    if not has_staff_header(request, header_name, header_value):
-        return False
-
+    # Staff recognition is by allowlist MXID ONLY (any client). The
+    # X-STAFF-Client header is intentionally NOT required here, so this
+    # matches the action side (redact/edit key off is_staff_user(MXID)
+    # alone). A staff account therefore gets the real/unfiltered view and
+    # has its stealth actions recognized consistently from any client.
     if requester is None:
         return False
 
