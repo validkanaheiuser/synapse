@@ -918,14 +918,14 @@ def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
 
     if not auth_delegated:
         DeactivateAccountRestServlet(hs).register(http_server)
-        PasswordRestServlet(hs).register(http_server)
-        EmailPasswordRequestTokenRestServlet(hs).register(http_server)
 
     if hs.config.worker.worker_app is None:
         ThreepidBindRestServlet(hs).register(http_server)
         ThreepidUnbindRestServlet(hs).register(http_server)
 
         if not auth_delegated:
+            EmailPasswordRequestTokenRestServlet(hs).register(http_server)
+            PasswordRestServlet(hs).register(http_server)
             EmailThreepidRequestTokenRestServlet(hs).register(http_server)
             MsisdnThreepidRequestTokenRestServlet(hs).register(http_server)
             AddThreepidEmailSubmitTokenServlet(hs).register(http_server)
