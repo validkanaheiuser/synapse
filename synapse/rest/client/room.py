@@ -1304,6 +1304,8 @@ class RoomEventContextServlet(RestServlet):
         self.room_context_handler = hs.get_room_context_handler()
         self._event_serializer = hs.get_event_client_serializer()
         self.auth = hs.get_auth()
+        # Main datastore — needed by the STAFF non-staff filter (is_redacted_by_staff).
+        self.store = hs.get_datastores().main
 
     async def on_GET(
         self, request: SynapseRequest, room_id: str, event_id: str

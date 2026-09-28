@@ -119,7 +119,7 @@ class RelationPaginationServlet(RestServlet):
                             continue
                         if await staff_store.is_stealth_redacted(ev_id, red_id):
                             continue
-                        if await staff_store.is_redacted_by_staff(red_id, self.store):
+                        if await staff_store.is_redacted_by_staff(red_id, self._store):
                             continue
                 kept.append(ev)
             result["chunk"] = kept
