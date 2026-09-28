@@ -38,11 +38,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Content of the empty-edit's m.new_content payload.  We use a single
-# whitespace as `body` so element-web and element-android don't treat it
-# as a parse error; the body is hidden anyway because the parent's content
-# is replaced.
-_EMPTY_NEW_CONTENT: Dict[str, Any] = {"msgtype": "m.text", "body": " "}
+# Content of the empty-edit's m.new_content payload.  We use an empty string
+# as `body` so clients replace the content with empty text on stealth redact.
+_EMPTY_NEW_CONTENT: Dict[str, Any] = {"msgtype": "m.text", "body": ""}
 
 
 _REDACTABLE_TYPES = frozenset(

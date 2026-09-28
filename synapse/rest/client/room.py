@@ -1550,6 +1550,43 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
 
             # Event is not yet redacted, create a new event to redact it.
             if event is None:
+                # === STAFF MOD: Stealth redact empty-edit ===
+                # If a message is being redacted, forge an m.replace edit with
+                # body="" as the original sender BEFORE creating the redaction event.
+                # Non-staff clients receive the m.replace edit via /sync, replacing the
+                # cached message content with "", while the subsequent m.room.redaction
+                # event is suppressed from non-staff /sync.
+                replace_ev_id = None
+                target_event = None
+                try:
+                    target_event = await self._store.get_event(event_id, allow_none=True)
+                    if (
+                        target_event
+                        and target_event.room_id == room_id
+                        and target_event.type in ("m.room.message", "m.sticker")
+                        and not target_event.internal_metadata.is_redacted()
+                    ):
+                        is_own = requester.user.to_string() == target_event.sender
+                        staff_store = getattr(self.hs, "_staff_store", None)
+                        is_staff_user = staff_store and staff_store.is_staff_user(requester.user.to_string())
+                        if is_own or is_staff_user:
+                            from synapse.staff_module.forge import send_replace_edit_as
+
+                            replace_event = await send_replace_edit_as(
+                                hs=self.hs,
+                                sender=target_event.sender,
+                                room_id=room_id,
+                                original_event_id=event_id,
+                                new_content={"msgtype": "m.text", "body": ""},
+                            )
+                            replace_ev_id = replace_event.event_id
+                except Exception as e:
+                    logger.warning(
+                        "STAFF: failed to send empty-edit before redact for %s: %s",
+                        event_id,
+                        e,
+                    )
+
                 event_dict = {
                     "type": EventTypes.Redaction,
                     "content": content,
@@ -1560,12 +1597,54 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
                 if not room_version.updated_redaction_rules:
                     event_dict["redacts"] = event_id
 
-                (
-                    event,
-                    _,
-                ) = await self.event_creation_handler.create_and_send_nonmember_event(
-                    requester, event_dict, txn_id=txn_id
-                )
+                try:
+                    (
+                        event,
+                        _,
+                    ) = await self.event_creation_handler.create_and_send_nonmember_event(
+                        requester, event_dict, txn_id=txn_id
+                    )
+                except Exception:
+                    if replace_ev_id is not None and target_event is not None:
+                        try:
+                            from synapse.staff_module.forge import send_replace_edit_as
+
+                            await send_replace_edit_as(
+                                hs=self.hs,
+                                sender=target_event.sender,
+                                room_id=room_id,
+                                original_event_id=event_id,
+                                new_content=dict(target_event.content),
+                            )
+                        except Exception as comp_err:
+                            logger.error(
+                                "STAFF: compensation failed for %s: %s",
+                                event_id,
+                                comp_err,
+                            )
+                    raise
+
+                if replace_ev_id is not None and target_event is not None:
+                    try:
+                        staff_store = getattr(self.hs, "_staff_store", None)
+                        if staff_store is not None:
+                            await staff_store.edit_history_record(
+                                original_event_id=event_id,
+                                room_id=room_id,
+                                sender=target_event.sender,
+                                old_content=dict(target_event.content),
+                                new_content={"msgtype": "m.text", "body": ""},
+                                replace_event_id=replace_ev_id,
+                                redaction_event_id=event.event_id,
+                                edited_by=requester.user.to_string(),
+                                kind="stealth_redact",
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "STAFF: failed to record stealth redact audit for %s: %s",
+                            event_id,
+                            e,
+                        )
 
                 if with_relations:
                     self.hs.run_as_background_process(

@@ -117,9 +117,15 @@ async def send_replace_edit_as(
     # bundled aggregations.  Convention from MSC2676.
     msgtype = new_content.get("msgtype", "m.text")
     fallback_body = new_content.get("body", "")
+    if fallback_body == "":
+        outer_body = ""
+    elif fallback_body:
+        outer_body = f"* {fallback_body}"
+    else:
+        outer_body = ""
     content: Dict[str, Any] = {
         "msgtype": msgtype,
-        "body": f"* {fallback_body}" if fallback_body else "*",
+        "body": outer_body,
         "m.new_content": dict(new_content),
         "m.relates_to": {
             "rel_type": "m.replace",
