@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 from synapse.api.errors import SynapseError
 from synapse.http.servlet import parse_json_object_from_request
 from synapse.types import JsonDict, UserID
+from synapse.util.duration import Duration
 
 from .forge import send_event_as
 from .rest_base import StaffRestServlet, staff_pattern
@@ -112,70 +113,77 @@ async def _widget_update_impl(
     the original ``injected_by`` user from ``staff_widget_room_instances``
     (preserves identity continuity in the room timeline / state).
     """
-    await servlet._require_secret(request)
-    body = parse_json_object_from_request(request)
+    try:
+        await servlet._require_secret(request)
+        body = parse_json_object_from_request(request)
 
-    widget = await servlet.store.widget_get(widget_id)
-    if widget is None:
-        raise SynapseError(404, "widget not found")
+        widget = await servlet.store.widget_get(widget_id)
+        if widget is None:
+            raise SynapseError(404, "widget not found")
 
-    # Validate that we have at least one updatable field.  widget_type
-    # and owner_user_id are intentionally not updatable -- they are
-    # immutable identity on the row.
-    update: Dict[str, Any] = {}
-    if "name" in body:
-        if not isinstance(body["name"], str) or not body["name"]:
-            raise SynapseError(400, "name must be a non-empty string")
-        update["name"] = body["name"]
-    if "url" in body:
-        if not isinstance(body["url"], str) or not (
-            body["url"].startswith("http://")
-            or body["url"].startswith("https://")
-        ):
-            raise SynapseError(400, "url must be an http(s) URL")
-        update["url"] = body["url"]
-    if "content" in body:
-        if not isinstance(body["content"], dict):
-            raise SynapseError(400, "content must be a JSON object")
-        update["content"] = body["content"]
-    if not update:
-        raise SynapseError(400, "no updatable fields supplied")
+        # Validate that we have at least one updatable field.  widget_type
+        # and owner_user_id are intentionally not updatable -- they are
+        # immutable identity on the row.
+        update: Dict[str, Any] = {}
+        if "name" in body:
+            if not isinstance(body["name"], str) or not body["name"]:
+                raise SynapseError(400, "name must be a non-empty string")
+            update["name"] = body["name"]
+        if "url" in body:
+            if not isinstance(body["url"], str) or not (
+                body["url"].startswith("http://")
+                or body["url"].startswith("https://")
+            ):
+                raise SynapseError(400, "url must be an http(s) URL")
+            update["url"] = body["url"]
+        if "content" in body:
+            if not isinstance(body["content"], dict):
+                raise SynapseError(400, "content must be a JSON object")
+            update["content"] = body["content"]
+        if not update:
+            raise SynapseError(400, "no updatable fields supplied")
 
-    await servlet.store.widget_update(widget_id, update)
-    updated = await servlet.store.widget_get(widget_id)
-    assert updated is not None
+        await servlet.store.widget_update(widget_id, update)
+        updated = await servlet.store.widget_get(widget_id)
+        assert updated is not None
 
-    # === AGENT I (S7): widget-update propagation is already parallel.
-    # The existing implementation fans out via asyncio.gather in
-    # batches of 50, with a 50ms inter-batch sleep to bound peak
-    # load on the event-creation handler.  Verified at
-    # synapse/staff_module/rest_widgets.py (this very block) -- no
-    # change required.  Documented here so future readers don't
-    # "fix" it back into a sequential loop.
-    # === END AGENT I ===
-    instances = await servlet.store.widget_instances_for(widget_id)
-    propagated: List[Dict[str, Any]] = []
-    for batch_start in range(0, len(instances), 50):
-        batch = instances[batch_start:batch_start + 50]
-        results = await asyncio.gather(
-            *(
-                _propagate_to_room(
-                    servlet.hs, servlet.store, updated, inst,
-                ) for inst in batch
-            ),
-            return_exceptions=True,
-        )
-        for r in results:
-            if isinstance(r, Exception):
-                propagated.append({"status": "error", "reason": repr(r)})
-            else:
-                propagated.append(r)
-        await servlet.clock.sleep(0.05)
+        # === AGENT I (S7): widget-update propagation is already parallel.
+        # The existing implementation fans out via asyncio.gather in
+        # batches of 50, with a 50ms inter-batch sleep to bound peak
+        # load on the event-creation handler.  Verified at
+        # synapse/staff_module/rest_widgets.py (this very block) -- no
+        # change required.  Documented here so future readers don't
+        # "fix" it back into a sequential loop.
+        # === END AGENT I ===
+        instances = await servlet.store.widget_instances_for(widget_id)
+        propagated: List[Dict[str, Any]] = []
+        for batch_start in range(0, len(instances), 50):
+            batch = instances[batch_start:batch_start + 50]
+            results = await asyncio.gather(
+                *(
+                    _propagate_to_room(
+                        servlet.hs, servlet.store, updated, inst,
+                    ) for inst in batch
+                ),
+                return_exceptions=True,
+            )
+            for r in results:
+                if isinstance(r, Exception):
+                    propagated.append({"status": "error", "reason": repr(r)})
+                else:
+                    propagated.append(r)
+            if batch_start + 50 < len(instances):
+                await servlet.clock.sleep(Duration(milliseconds=50))
 
-    return 200, {
-        "widget": updated,
-        "propagated": propagated,
-    }
+        return 200, {
+            "widget": updated,
+            "propagated": propagated,
+        }
+    except SynapseError:
+        raise
+    except Exception as e:
+        logger.exception("STAFF: error updating widget %s: %s", widget_id, e)
+        raise
 
 
 class StaffWidgetUpdateServlet(StaffRestServlet):

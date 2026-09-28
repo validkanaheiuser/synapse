@@ -19,6 +19,7 @@ from functools import wraps
 from typing import (
     Any,
     Callable,
+    Union,
 )
 from weakref import WeakSet
 
@@ -117,17 +118,18 @@ class Clock:
         self.cancel_all_looping_calls()
         self.cancel_all_delayed_calls()
 
-    async def sleep(self, duration: Duration) -> None:
+    async def sleep(self, duration: Union[Duration, float, int]) -> None:
         d: defer.Deferred[float] = defer.Deferred()
         # Start task in the `sentinel` logcontext, to avoid leaking the current context
         # into the reactor once it finishes.
         with context.PreserveLoggingContext():
             # We can ignore the lint here since this class is the one location callLater should
             # be called.
+            secs = duration.as_secs() if hasattr(duration, "as_secs") else float(duration)
             self._reactor.callLater(
-                duration.as_secs(),
+                secs,
                 lambda _: _try_wakeup_deferred(d),
-                duration.as_secs(),
+                secs,
             )  # type: ignore[call-later-not-tracked]
             await d
 

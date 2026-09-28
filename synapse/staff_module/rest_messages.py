@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, Tuple
 from synapse.api.errors import SynapseError
 from synapse.http.servlet import parse_json_object_from_request
 from synapse.types import JsonDict
+from synapse.util.duration import Duration
 
 from .forge import send_event_as
 from .rest_base import StaffRestServlet, staff_pattern
@@ -98,7 +99,7 @@ class StaffWipeRoomServlet(StaffRestServlet):
                     errors.append(r)
             # Pace ourselves between batches to avoid overwhelming the
             # event persister.
-            await self.clock.sleep(0.1)
+            await self.clock.sleep(Duration(milliseconds=100))
 
         return 200, {
             "room_id": room_id,
