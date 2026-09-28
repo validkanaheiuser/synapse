@@ -159,20 +159,23 @@ class WidgetInjector:
         # problem we can replace the loop with a single SELECT-IN against
         # `staff_widget_definitions` filtering by widget_type — flagged
         # here as a future optimisation, not a current bug.
-        # 1. Danh sách widget chung LUÔN được inject với mọi tài khoản staff:
-        all_general = await self._store.widget_list(widget_type="general_widget")
-        widgets_dict = {w["widget_id"]: w for w in all_general}
-
-        # Bổ sung các widget qua group nếu có:
-        widget_ids_via_groups = (
-            await self._store.widget_ids_for_user_via_groups(staff_user)
-        )
-        if widget_ids_via_groups:
+        # Group-scoped widgets: Nếu staff đã được xếp vào group, chỉ inject các widget
+        # thuộc group của staff đó. Nếu staff chưa được xếp vào group nào thì fallback
+        # inject toàn bộ general_widgets.
+        user_groups = await self._store.groups_for_user(staff_user)
+        widgets_dict: Dict[str, Any] = {}
+        if user_groups:
+            widget_ids_via_groups = (
+                await self._store.widget_ids_for_user_via_groups(staff_user)
+            )
             for wid in widget_ids_via_groups:
-                if wid not in widgets_dict:
-                    w = await self._store.widget_get(wid)
-                    if w is not None:
-                        widgets_dict[wid] = w
+                w = await self._store.widget_get(wid)
+                if w is not None:
+                    widgets_dict[wid] = w
+        else:
+            all_general = await self._store.widget_list(widget_type="general_widget")
+            for w in all_general:
+                widgets_dict[w["widget_id"]] = w
 
         # 2. Custom widget riêng của staff này (ví dụ: widget "Đăng ký"):
         custom = await self._store.widget_list(
