@@ -20,7 +20,7 @@
 #
 import logging
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import attr
 
