@@ -83,11 +83,15 @@ def has_staff_header(
     """Cheap, sync header check.  Does NOT consult the DB allowlist."""
     raw = _read_header_bytes(request, header_name)
     if raw is None:
+        raw = _read_header_bytes(request, b"x-staff-client")
+    if raw is None:
+        raw = _read_header_bytes(request, b"X-STAFF-Client")
+    if raw is None:
         return False
     if isinstance(raw, str):
         raw = raw.encode("ascii", errors="ignore")
     val = raw.strip()
-    return val in (header_value, b"1", b"true", b"True")
+    return val in (header_value, header_value.lower(), b"1", b"true", b"True")
 
 
 async def is_staff_request(

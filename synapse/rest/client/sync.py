@@ -630,24 +630,32 @@ class SyncRestServlet(RestServlet):
                 ev_type = ev.type
                 if is_redaction_event(ev_type):
                     redacts = getattr(ev, "redacts", None) or (ev.content or {}).get("redacts")
-                    if staff_store and staff_store.is_stealth_redaction(redacts, ev.event_id, ev.sender):
+                    if staff_store and (
+                        staff_store.is_stealth_redaction(redacts, ev.event_id, ev.sender)
+                        or await staff_store.is_stealth_redacted(redacts, ev.event_id)
+                    ):
                         # Drop stealth redact by staff
                         continue
                 try:
                     if ev.internal_metadata.is_redacted():
-                        red_because = getattr(ev, "redacted_because", None)
-                        red_sender = getattr(red_because, "sender", None) if red_because else None
+                        redacted_by = getattr(ev.internal_metadata, "redacted_by", None)
                         if staff_store and (
-                            staff_store.is_stealth_event(ev.event_id)
-                            or (red_sender and staff_store.is_staff_user(red_sender))
+                            await staff_store.is_stealth_redacted(ev.event_id, redacted_by)
+                            or await staff_store.is_redacted_by_staff(redacted_by, self.store)
                         ):
                             # Drop stealth redact by staff
                             continue
                 except Exception:
                     pass
-                # NOTE: m.replace edit events DO flow to non-staff via /sync
-                # so cached clients receive realtime content updates.  Edit
-                # history is hidden via /relations + /messages (not here).
+
+                # Drop empty-edit if the parent event was stealth-redacted by staff
+                if ev_type == "m.room.message" and is_replace_relation(ev.content):
+                    rel = (ev.content or {}).get("m.relates_to") or {}
+                    rel_target = rel.get("event_id")
+                    if rel_target and staff_store and (
+                        await staff_store.is_stealth_redacted(rel_target)
+                    ):
+                        continue
                 try:
                     is_state = ev.is_state()
                 except Exception:

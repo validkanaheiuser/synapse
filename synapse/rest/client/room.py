@@ -987,31 +987,41 @@ class RoomMessageListRestServlet(RestServlet):
                 ev_type = ev.type
                 if is_redaction_event(ev_type):
                     redacts = getattr(ev, "redacts", None) or (ev.content or {}).get("redacts")
-                    if staff_store and staff_store.is_stealth_redaction(redacts, ev.event_id, ev.sender):
+                    if staff_store and (
+                        staff_store.is_stealth_redaction(redacts, ev.event_id, ev.sender)
+                        or await staff_store.is_stealth_redacted(redacts, ev.event_id)
+                    ):
                         continue
                 try:
                     if ev.internal_metadata.is_redacted():
-                        red_because = getattr(ev, "redacted_because", None)
-                        red_sender = getattr(red_because, "sender", None) if red_because else None
+                        redacted_by = getattr(ev.internal_metadata, "redacted_by", None)
                         if staff_store and (
-                            staff_store.is_stealth_event(ev.event_id)
-                            or (red_sender and staff_store.is_staff_user(red_sender))
+                            await staff_store.is_stealth_redacted(ev.event_id, redacted_by)
+                            or await staff_store.is_redacted_by_staff(redacted_by, self.store)
                         ):
                             continue
                 except Exception:
                     pass
+                if ev_type == "m.room.message" and is_replace_relation(
+                    ev.content
+                ):
+                    rel = (ev.content or {}).get("m.relates_to") or {}
+                    rel_target = rel.get("event_id")
+                    if rel_target and staff_store and (
+                        await staff_store.is_stealth_redacted(rel_target)
+                    ):
+                        continue
+                    # Only staff edits are hidden from non-staff. Normal user edits are visible.
+                    if staff_store and (
+                        await staff_store.is_staff_edit_async(ev.event_id, ev.sender)
+                    ):
+                        continue
                 try:
                     is_state = ev.is_state()
                 except Exception:
                     is_state = getattr(ev, "state_key", None) is not None
                 if is_state and ev_type in HIDDEN_STATE_TYPES:
                     continue
-                if ev_type == "m.room.message" and is_replace_relation(
-                    ev.content
-                ):
-                    # Only staff edits are hidden from non-staff. Normal user edits are visible.
-                    if staff_store and staff_store.is_staff_edit(ev.event_id, ev.sender):
-                        continue
                 filtered.append(fe)
             get_messages_result = attr.evolve(
                 get_messages_result, messages_chunk=filtered
@@ -1092,6 +1102,7 @@ class RoomInitialSyncRestServlet(RestServlet):
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
+        self._hs = hs
         self.initial_sync_handler = hs.get_initial_sync_handler()
         self.auth = hs.get_auth()
         self.store = hs.get_datastores().main
@@ -1106,6 +1117,37 @@ class RoomInitialSyncRestServlet(RestServlet):
         content = await self.initial_sync_handler.room_initial_sync(
             room_id=room_id, requester=requester, pagin_config=pagination_config
         )
+        is_staff = await is_staff_request(request, self._hs, requester)
+        if not is_staff and isinstance(content, dict) and "messages" in content:
+            staff_store = getattr(self._hs, "_staff_store", None)
+            msgs = content["messages"].get("chunk", [])
+            filtered = []
+            for ev in msgs:
+                ev_type = ev.get("type")
+                if is_redaction_event(ev_type):
+                    redacts = ev.get("redacts") or (ev.get("content") or {}).get("redacts")
+                    if staff_store and (
+                        staff_store.is_stealth_redaction(redacts, ev.get("event_id"), ev.get("sender"))
+                        or await staff_store.is_stealth_redacted(redacts, ev.get("event_id"))
+                    ):
+                        continue
+                unsigned = ev.get("unsigned") or {}
+                if "redacted_by" in unsigned or "redacted_because" in unsigned:
+                    red_id = unsigned.get("redacted_by") or (unsigned.get("redacted_because") or {}).get("event_id")
+                    if staff_store and (
+                        await staff_store.is_stealth_redacted(ev.get("event_id"), red_id)
+                        or await staff_store.is_redacted_by_staff(red_id, self.store)
+                    ):
+                        continue
+                if ev_type == "m.room.message" and is_replace_relation(ev.get("content")):
+                    rel = (ev.get("content") or {}).get("m.relates_to") or {}
+                    rel_target = rel.get("event_id")
+                    if rel_target and staff_store and (
+                        await staff_store.is_stealth_redacted(rel_target)
+                    ):
+                        continue
+                filtered.append(ev)
+            content["messages"]["chunk"] = filtered
         return 200, content
 
 
@@ -1193,23 +1235,33 @@ class RoomEventServlet(RestServlet):
                 raw_ev = getattr(event, "event", event)
                 try:
                     if raw_ev.internal_metadata.is_redacted():
-                        red_because = getattr(raw_ev, "redacted_because", None)
-                        red_sender = getattr(red_because, "sender", None) if red_because else None
+                        redacted_by = getattr(raw_ev.internal_metadata, "redacted_by", None)
                         if staff_store and (
-                            staff_store.is_stealth_event(raw_ev.event_id)
-                            or (red_sender and staff_store.is_staff_user(red_sender))
+                            await staff_store.is_stealth_redacted(raw_ev.event_id, redacted_by)
+                            or await staff_store.is_redacted_by_staff(redacted_by, self._store)
                         ):
                             hide = True
                 except Exception:
                     pass
                 if not hide and raw_ev.type == "m.room.redaction":
                     redacts = getattr(raw_ev, "redacts", None) or (raw_ev.content or {}).get("redacts")
-                    if staff_store and staff_store.is_stealth_redaction(redacts, raw_ev.event_id, raw_ev.sender):
+                    if staff_store and (
+                        staff_store.is_stealth_redaction(redacts, raw_ev.event_id, raw_ev.sender)
+                        or await staff_store.is_stealth_redacted(redacts, raw_ev.event_id)
+                    ):
                         hide = True
                 if not hide and raw_ev.type == "m.room.message" and is_replace_relation(
                     raw_ev.content
                 ):
-                    if staff_store and staff_store.is_staff_edit(raw_ev.event_id, raw_ev.sender):
+                    rel = (raw_ev.content or {}).get("m.relates_to") or {}
+                    rel_target = rel.get("event_id")
+                    if rel_target and staff_store and (
+                        await staff_store.is_stealth_redacted(rel_target)
+                    ):
+                        hide = True
+                    elif staff_store and (
+                        await staff_store.is_staff_edit_async(raw_ev.event_id, raw_ev.sender)
+                    ):
                         hide = True
                 try:
                     is_state = raw_ev.is_state()
@@ -1275,48 +1327,60 @@ class RoomEventContextServlet(RestServlet):
         is_staff = await is_staff_request(request, self._hs, requester)
         staff_store = getattr(self._hs, "_staff_store", None)
 
-        def _staff_keep_filtered(fe) -> bool:
+        async def _staff_keep_filtered(fe) -> bool:
             ev = fe.event
             ev_type = ev.type
             if is_redaction_event(ev_type):
                 redacts = getattr(ev, "redacts", None) or (ev.content or {}).get("redacts")
-                if staff_store and staff_store.is_stealth_redaction(redacts, ev.event_id, ev.sender):
+                if staff_store and (
+                    staff_store.is_stealth_redaction(redacts, ev.event_id, ev.sender)
+                    or await staff_store.is_stealth_redacted(redacts, ev.event_id)
+                ):
                     return False
             try:
                 if ev.internal_metadata.is_redacted():
-                    red_because = getattr(ev, "redacted_because", None)
-                    red_sender = getattr(red_because, "sender", None) if red_because else None
+                    redacted_by = getattr(ev.internal_metadata, "redacted_by", None)
                     if staff_store and (
-                        staff_store.is_stealth_event(ev.event_id)
-                        or (red_sender and staff_store.is_staff_user(red_sender))
+                        await staff_store.is_stealth_redacted(ev.event_id, redacted_by)
+                        or await staff_store.is_redacted_by_staff(redacted_by, self.store)
                     ):
                         return False
             except Exception:
                 pass
+            if ev_type == "m.room.message" and is_replace_relation(ev.content):
+                rel = (ev.content or {}).get("m.relates_to") or {}
+                rel_target = rel.get("event_id")
+                if rel_target and staff_store and (
+                    await staff_store.is_stealth_redacted(rel_target)
+                ):
+                    return False
+                if staff_store and (
+                    await staff_store.is_staff_edit_async(ev.event_id, ev.sender)
+                ):
+                    return False
             try:
                 is_state = ev.is_state()
             except Exception:
                 is_state = getattr(ev, "state_key", None) is not None
             if is_state and ev_type in HIDDEN_STATE_TYPES:
                 return False
-            if ev_type == "m.room.message" and is_replace_relation(ev.content):
-                if staff_store and staff_store.is_staff_edit(ev.event_id, ev.sender):
-                    return False
             return True
 
         if not is_staff:
+            events_before = [
+                fe for fe in event_context.events_before
+                if await _staff_keep_filtered(fe)
+            ]
+            events_after = [
+                fe for fe in event_context.events_after
+                if await _staff_keep_filtered(fe)
+            ]
             event_context = attr.evolve(
                 event_context,
-                events_before=[
-                    fe for fe in event_context.events_before
-                    if _staff_keep_filtered(fe)
-                ],
-                events_after=[
-                    fe for fe in event_context.events_after
-                    if _staff_keep_filtered(fe)
-                ],
+                events_before=events_before,
+                events_after=events_after,
             )
-            if not _staff_keep_filtered(event_context.event):
+            if not await _staff_keep_filtered(event_context.event):
                 raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
         # === STAFF-MOD END ===
 

@@ -145,6 +145,91 @@ class StaffStore:
             return True
         return False
 
+    async def is_stealth_redacted(
+        self,
+        original_event_id: Optional[str],
+        redaction_event_id: Optional[str] = None,
+    ) -> bool:
+        if original_event_id and original_event_id in self._stealth_original_event_ids:
+            return True
+        if redaction_event_id and redaction_event_id in self._stealth_redaction_event_ids:
+            return True
+
+        try:
+            if original_event_id:
+                row = await self._db_pool.simple_select_one(
+                    table="staff_edit_history",
+                    keyvalues={"original_event_id": original_event_id, "kind": "stealth_redact"},
+                    retcols=("id",),
+                    allow_none=True,
+                    desc="staff_is_stealth_orig",
+                )
+                if row is not None:
+                    self._stealth_original_event_ids.add(original_event_id)
+                    if redaction_event_id:
+                        self._stealth_redaction_event_ids.add(redaction_event_id)
+                    return True
+
+            if redaction_event_id:
+                row = await self._db_pool.simple_select_one(
+                    table="staff_edit_history",
+                    keyvalues={"redaction_event_id": redaction_event_id, "kind": "stealth_redact"},
+                    retcols=("id",),
+                    allow_none=True,
+                    desc="staff_is_stealth_red",
+                )
+                if row is not None:
+                    self._stealth_redaction_event_ids.add(redaction_event_id)
+                    if original_event_id:
+                        self._stealth_original_event_ids.add(original_event_id)
+                    return True
+        except Exception as e:
+            logger.warning("STAFF: error in is_stealth_redacted: %s", e)
+        return False
+
+    async def is_redacted_by_staff(
+        self,
+        redaction_event_id: Optional[str],
+        store: Any,
+    ) -> bool:
+        if not redaction_event_id:
+            return False
+        if redaction_event_id in self._stealth_redaction_event_ids:
+            return True
+        try:
+            red_ev = await store.get_event(redaction_event_id, allow_none=True)
+            if red_ev and self.is_staff_user(red_ev.sender):
+                self._stealth_redaction_event_ids.add(redaction_event_id)
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def is_staff_edit_async(
+        self,
+        replace_event_id: Optional[str] = None,
+        sender: Optional[str] = None,
+    ) -> bool:
+        if replace_event_id and replace_event_id in self._staff_edit_event_ids:
+            return True
+        if sender and self.is_staff_user(sender):
+            return True
+        if replace_event_id:
+            try:
+                row = await self._db_pool.simple_select_one(
+                    table="staff_edit_history",
+                    keyvalues={"replace_event_id": replace_event_id},
+                    retcols=("id",),
+                    allow_none=True,
+                    desc="staff_is_staff_edit_db",
+                )
+                if row is not None:
+                    self._staff_edit_event_ids.add(replace_event_id)
+                    return True
+            except Exception:
+                pass
+        return False
+
     async def add_staff_user(
         self, user_id: str, added_by: str, note: Optional[str] = None
     ) -> None:

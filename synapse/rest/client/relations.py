@@ -107,13 +107,20 @@ class RelationPaginationServlet(RestServlet):
                     # Only hide if it was a STAFF edit! Normal user edit history remains visible.
                     ev_sender = ev.get("sender")
                     ev_id = ev.get("event_id")
-                    if staff_store and staff_store.is_staff_edit(replace_event_id=ev_id, sender=ev_sender):
+                    if staff_store and await staff_store.is_staff_edit_async(replace_event_id=ev_id, sender=ev_sender):
                         continue
                 if (ev.get("unsigned") or {}).get("redacted_because"):
                     red_because = (ev.get("unsigned") or {}).get("redacted_because") or {}
                     red_sender = red_because.get("sender")
-                    if staff_store and staff_store.is_stealth_redaction(ev.get("event_id"), red_because.get("event_id"), red_sender):
-                        continue
+                    red_id = red_because.get("event_id")
+                    ev_id = ev.get("event_id")
+                    if staff_store:
+                        if staff_store.is_stealth_redaction(ev_id, red_id, red_sender):
+                            continue
+                        if await staff_store.is_stealth_redacted(ev_id, red_id):
+                            continue
+                        if await staff_store.is_redacted_by_staff(red_id, self.store):
+                            continue
                 kept.append(ev)
             result["chunk"] = kept
             # Empty out the pagination tokens only if no relations were kept.
