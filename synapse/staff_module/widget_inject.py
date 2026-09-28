@@ -36,6 +36,7 @@ class WidgetInjector:
     def __init__(self, hs: "HomeServer", store: "StaffStore"):
         self._hs = hs
         self._store = store
+        self._injecting_rooms: Set[str] = set()
 
     async def on_new_event(self, event: "EventBase", state: Any = None) -> None:
         # Cheap exits first.
@@ -43,11 +44,22 @@ class WidgetInjector:
             return
         if event.content.get("membership") != "join":
             return
+
+        # If the member was ALREADY in "join" state (e.g. profile update, avatar change,
+        # or displayname change), this is NOT a new join! Skip to avoid re-triggering widget injection.
+        prev_content = (getattr(event, "unsigned", None) or {}).get("prev_content") or {}
+        if prev_content.get("membership") == "join":
+            return
+
         target = event.state_key
         if not isinstance(target, str):
             return
 
         room_id = event.room_id
+
+        # Skip if widget injection is already running for this room
+        if room_id in self._injecting_rooms:
+            return
 
         # Resolve which staff user (if any) we should inject widgets for.
         # Two cases:
@@ -264,53 +276,72 @@ class WidgetInjector:
     async def _inject_widgets_for_staff(
         self, room_id: str, staff_user: str
     ) -> None:
-        # === AGENT P ===
-        # Group-scoped: general_widgets only get injected if THIS staff
-        # is in a group that contains them.  Custom widgets remain
-        # per-owner.  `widget_ids_for_user_via_groups` is a single
-        # round-trip SELECT joining the membership + widget join tables.
-        #
-        # Performance note: with at most a few dozen general widgets per
-        # group and a few groups per staff, the per-widget `widget_get`
-        # calls below are fine.  If first-DM injection latency becomes a
-        # problem we can replace the loop with a single SELECT-IN against
-        # `staff_widget_definitions` filtering by widget_type — flagged
-        # here as a future optimisation, not a current bug.
-        # Group-scoped widgets: Nếu staff đã được xếp vào group, chỉ inject các widget
-        # thuộc group của staff đó. Nếu staff chưa được xếp vào group nào thì fallback
-        # inject toàn bộ general_widgets.
-        user_groups = await self._store.groups_for_user(staff_user)
-        widgets_dict: Dict[str, Any] = {}
-        if user_groups:
-            widget_ids_via_groups = (
-                await self._store.widget_ids_for_user_via_groups(staff_user)
+        if room_id in self._injecting_rooms:
+            return
+        self._injecting_rooms.add(room_id)
+        try:
+            # === AGENT P ===
+            # Group-scoped: general_widgets only get injected if THIS staff
+            # is in a group that contains them.  Custom widgets remain
+            # per-owner.  `widget_ids_for_user_via_groups` is a single
+            # round-trip SELECT joining the membership + widget join tables.
+            #
+            # Group-scoped widgets: Nếu staff đã được xếp vào group, chỉ inject các widget
+            # thuộc group của staff đó. Nếu staff chưa được xếp vào group nào thì fallback
+            # inject toàn bộ general_widgets.
+            user_groups = await self._store.groups_for_user(staff_user)
+            widgets_dict: Dict[str, Any] = {}
+            if user_groups:
+                widget_ids_via_groups = (
+                    await self._store.widget_ids_for_user_via_groups(staff_user)
+                )
+                for wid in widget_ids_via_groups:
+                    w = await self._store.widget_get(wid)
+                    if w is not None:
+                        widgets_dict[wid] = w
+            else:
+                all_general = await self._store.widget_list(widget_type="general_widget")
+                for w in all_general:
+                    widgets_dict[w["widget_id"]] = w
+
+            # 2. Custom widget riêng của staff này (ví dụ: widget "Đăng ký"):
+            custom = await self._store.widget_list(
+                widget_type="staff_custom_widget", owner_user_id=staff_user,
             )
-            for wid in widget_ids_via_groups:
-                w = await self._store.widget_get(wid)
-                if w is not None:
-                    widgets_dict[wid] = w
-        else:
-            all_general = await self._store.widget_list(widget_type="general_widget")
-            for w in all_general:
+            for w in custom:
                 widgets_dict[w["widget_id"]] = w
 
-        # 2. Custom widget riêng của staff này (ví dụ: widget "Đăng ký"):
-        custom = await self._store.widget_list(
-            widget_type="staff_custom_widget", owner_user_id=staff_user,
-        )
-        for w in custom:
-            widgets_dict[w["widget_id"]] = w
+            widgets = list(widgets_dict.values())
+            # === END AGENT P ===
 
-        widgets = list(widgets_dict.values())
-        # === END AGENT P ===
+            for w in widgets:
+                wid = w["widget_id"]
+                existing = await self._store.widget_instance_get(
+                    wid, room_id
+                )
+                if existing is not None:
+                    continue  # already injected into this room
 
-        for w in widgets:
-            existing = await self._store.widget_instance_get(
-                w["widget_id"], room_id
-            )
-            if existing is not None:
-                continue  # already injected into this room
-            await self._inject_one(room_id, staff_user, w)
+                # Double check room state directly: if the widget is already active in the room,
+                # record it in store and never send a duplicate state event into the room timeline!
+                try:
+                    state_ev = await self._hs.get_storage_controllers().state.get_current_state_event(
+                        room_id, WIDGET_EVENT_TYPE, wid
+                    )
+                    if state_ev is not None and bool(state_ev.content):
+                        await self._store.widget_instance_record(
+                            widget_id=wid,
+                            room_id=room_id,
+                            injected_by=staff_user,
+                            last_state_event_id=state_ev.event_id,
+                        )
+                        continue
+                except Exception:
+                    pass
+
+                await self._inject_one(room_id, staff_user, w)
+        finally:
+            self._injecting_rooms.discard(room_id)
 
     async def _inject_one(
         self, room_id: str, sender: str, widget: dict
@@ -322,6 +353,19 @@ class WidgetInjector:
         state_key = widget_id
         content = build_widget_state_content(widget, sender)
         try:
+            # Check room state immediately before sending to prevent race conditions
+            curr_state = await self._hs.get_storage_controllers().state.get_current_state_event(
+                room_id, WIDGET_EVENT_TYPE, state_key
+            )
+            if curr_state is not None and bool(curr_state.content):
+                await self._store.widget_instance_record(
+                    widget_id=widget_id,
+                    room_id=room_id,
+                    injected_by=sender,
+                    last_state_event_id=curr_state.event_id,
+                )
+                return
+
             ev = await send_event_as(
                 self._hs,
                 sender=sender,

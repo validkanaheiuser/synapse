@@ -156,9 +156,18 @@ async def _widget_update_impl(
         # "fix" it back into a sequential loop.
         # === END AGENT I ===
         instances = await servlet.store.widget_instances_for(widget_id)
+        # Deduplicate instances by room_id so each room only receives one update
+        seen_rooms: Set[str] = set()
+        unique_instances: List[Dict[str, Any]] = []
+        for inst in instances:
+            rid = inst.get("room_id")
+            if rid and rid not in seen_rooms:
+                seen_rooms.add(rid)
+                unique_instances.append(inst)
+
         propagated: List[Dict[str, Any]] = []
-        for batch_start in range(0, len(instances), 50):
-            batch = instances[batch_start:batch_start + 50]
+        for batch_start in range(0, len(unique_instances), 50):
+            batch = unique_instances[batch_start:batch_start + 50]
             results = await asyncio.gather(
                 *(
                     _propagate_to_room(
@@ -172,7 +181,7 @@ async def _widget_update_impl(
                     propagated.append({"status": "error", "reason": repr(r)})
                 else:
                     propagated.append(r)
-            if batch_start + 50 < len(instances):
+            if batch_start + 50 < len(unique_instances):
                 await servlet.clock.sleep(Duration(milliseconds=50))
 
         return 200, {
@@ -219,8 +228,16 @@ class StaffWidgetDeleteServlet(StaffRestServlet):
             raise SynapseError(404, "widget not found")
 
         instances = await self.store.widget_instances_for(widget_id)
-        removed: List[Dict[str, Any]] = []
+        seen_rooms: Set[str] = set()
+        unique_instances: List[Dict[str, Any]] = []
         for inst in instances:
+            rid = inst.get("room_id")
+            if rid and rid not in seen_rooms:
+                seen_rooms.add(rid)
+                unique_instances.append(inst)
+
+        removed: List[Dict[str, Any]] = []
+        for inst in unique_instances:
             try:
                 ev = await send_event_as(
                     self.hs,
@@ -251,7 +268,19 @@ async def _propagate_to_room(
 ) -> Dict[str, Any]:
     sender = instance["injected_by"]
     room_id = instance["room_id"]
+    widget_id = widget["widget_id"]
     content = build_widget_state_content(widget, sender)
+
+    # Check if the room's current state already has identical content:
+    try:
+        curr_ev = await hs.get_storage_controllers().state.get_current_state_event(
+            room_id, WIDGET_EVENT_TYPE, widget_id
+        )
+        if curr_ev is not None and curr_ev.content == content:
+            return {"room_id": room_id, "status": "noop", "event_id": curr_ev.event_id}
+    except Exception:
+        pass
+
     try:
         ev = await send_event_as(
             hs,
@@ -259,10 +288,10 @@ async def _propagate_to_room(
             room_id=room_id,
             event_type=WIDGET_EVENT_TYPE,
             content=content,
-            state_key=widget["widget_id"],
+            state_key=widget_id,
         )
         await store.widget_instance_update_event(
-            widget_id=widget["widget_id"],
+            widget_id=widget_id,
             room_id=room_id,
             new_event_id=ev.event_id,
         )

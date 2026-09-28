@@ -67,6 +67,41 @@ class StaffStore:
         except Exception:
             logger.exception("STAFF: error ensuring staff_dm_names table exists")
 
+        def _ensure_widget_instances_table(txn):
+            txn.execute(
+                "CREATE TABLE IF NOT EXISTS staff_widget_room_instances ("
+                "    instance_id TEXT PRIMARY KEY,"
+                "    widget_id TEXT NOT NULL,"
+                "    room_id TEXT NOT NULL,"
+                "    injected_by TEXT NOT NULL,"
+                "    last_state_event_id TEXT,"
+                "    created_ts BIGINT NOT NULL"
+                ")"
+            )
+            # Remove any existing duplicates so that unique index can be created cleanly
+            try:
+                txn.execute(
+                    "DELETE FROM staff_widget_room_instances "
+                    "WHERE instance_id NOT IN ("
+                    "    SELECT MIN(instance_id) FROM staff_widget_room_instances "
+                    "    GROUP BY widget_id, room_id"
+                    ")"
+                )
+            except Exception:
+                pass
+            try:
+                txn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS staff_widget_room_instances_uniq "
+                    "ON staff_widget_room_instances (widget_id, room_id)"
+                )
+            except Exception:
+                pass
+
+        try:
+            await self._db_pool.runInteraction("staff_ensure_widget_instances_table", _ensure_widget_instances_table)
+        except Exception:
+            logger.exception("STAFF: error ensuring staff_widget_room_instances table and unique index")
+
         rows = await self._db_pool.simple_select_list(
             table="staff_users",
             keyvalues=None,
@@ -710,30 +745,41 @@ class StaffStore:
         last_state_event_id: Optional[str],
     ) -> str:
         instance_id = _new_id()
-        await self._db_pool.simple_upsert(
-            table="staff_widget_room_instances",
-            keyvalues={"widget_id": widget_id, "room_id": room_id},
-            values={
-                "instance_id": instance_id,
-                "injected_by": injected_by,
-                "last_state_event_id": last_state_event_id,
-                "created_ts": _now_ms(),
-            },
-            desc="staff_widget_instance_record",
-        )
+        try:
+            await self._db_pool.simple_upsert(
+                table="staff_widget_room_instances",
+                keyvalues={"widget_id": widget_id, "room_id": room_id},
+                values={
+                    "injected_by": injected_by,
+                    "last_state_event_id": last_state_event_id,
+                    "created_ts": _now_ms(),
+                },
+                insertion_values={
+                    "instance_id": instance_id,
+                },
+                desc="staff_widget_instance_record",
+            )
+        except Exception:
+            logger.exception(
+                "STAFF: failed to record widget instance %s in room %s",
+                widget_id, room_id,
+            )
         return instance_id
 
     async def widget_instance_get(
         self, widget_id: str, room_id: str
     ) -> Optional[Dict[str, Any]]:
-        row = await self._db_pool.simple_select_one(
-            table="staff_widget_room_instances",
-            keyvalues={"widget_id": widget_id, "room_id": room_id},
-            retcols=self._INSTANCE_COLS,
-            allow_none=True,
-            desc="staff_widget_instance_get",
-        )
-        return dict(zip(self._INSTANCE_COLS, row)) if row else None
+        try:
+            rows = await self._db_pool.simple_select_list(
+                table="staff_widget_room_instances",
+                keyvalues={"widget_id": widget_id, "room_id": room_id},
+                retcols=self._INSTANCE_COLS,
+                desc="staff_widget_instance_get",
+            )
+            return dict(zip(self._INSTANCE_COLS, rows[0])) if rows else None
+        except Exception:
+            logger.exception("STAFF: error in widget_instance_get for %s in %s", widget_id, room_id)
+            return None
 
     async def widget_instance_update_event(
         self, widget_id: str, room_id: str, new_event_id: str
