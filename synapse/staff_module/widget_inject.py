@@ -12,6 +12,7 @@
 # system messages never appear.
 #
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Set
 
@@ -136,13 +137,119 @@ class WidgetInjector:
             members: Set[str] = await main.get_users_in_room(room_id)
         except Exception:
             return False
-        # Strictly two members; one is the staff.  In a closed (federation
-        # off) deployment, that's the canonical "DM with staff" signal.
+
+        # Strictly two members; one is the staff.
         if len(members) != 2 or staff_user not in members:
             return False
-        # Belt-and-braces: also accept the room if the m.direct account
-        # data of either party lists the room id (Element-set flag).
-        return True
+
+        # 1. Check m.room.name: In Element, group creation requires a room name.
+        # Direct chats (DMs) NEVER have an m.room.name state event.
+        try:
+            name_ev = await self._hs.get_storage_controllers().state.get_current_state_event(
+                room_id, "m.room.name", ""
+            )
+            if name_ev is not None and (name_ev.content or {}).get("name"):
+                logger.info(
+                    "STAFF: Room %s has m.room.name (%r) -> it is a group, not a DM",
+                    room_id, (name_ev.content or {}).get("name"),
+                )
+                return False
+        except Exception:
+            pass
+
+        # 2. Check m.room.topic: A group may have a topic, DMs do not.
+        try:
+            topic_ev = await self._hs.get_storage_controllers().state.get_current_state_event(
+                room_id, "m.room.topic", ""
+            )
+            if topic_ev is not None and (topic_ev.content or {}).get("topic"):
+                logger.info(
+                    "STAFF: Room %s has m.room.topic -> it is a group, not a DM",
+                    room_id,
+                )
+                return False
+        except Exception:
+            pass
+
+        # 3. Check m.direct account data of either party (staff or the other member).
+        other_members = [m for m in members if m != staff_user]
+        other_user = other_members[0] if other_members else None
+
+        try:
+            for uid in (staff_user, other_user):
+                if not uid:
+                    continue
+                dm_map = await main.get_global_account_data_by_type_for_user(uid, "m.direct")
+                if isinstance(dm_map, dict):
+                    for room_list in dm_map.values():
+                        if isinstance(room_list, list) and room_id in room_list:
+                            logger.info(
+                                "STAFF: Room %s found in m.direct of %s -> confirmed DM",
+                                room_id, uid,
+                            )
+                            return True
+        except Exception:
+            pass
+
+        # 4. Check if any membership invite event or create event in the room had is_direct: True.
+        try:
+            is_direct_event = await main.db_pool.runInteraction(
+                "staff_check_is_direct_event",
+                self._check_is_direct_event_txn,
+                room_id,
+            )
+            if is_direct_event:
+                logger.info(
+                    "STAFF: Room %s has is_direct=True in event history -> confirmed DM",
+                    room_id,
+                )
+                return True
+        except Exception:
+            pass
+
+        # If it has neither m.direct nor is_direct flag, it's a 2-person group room, not a DM!
+        logger.info(
+            "STAFF: Room %s has 2 members but lacks m.direct and is_direct -> treated as group (not DM)",
+            room_id,
+        )
+        return False
+
+    def _check_is_direct_event_txn(self, txn, room_id: str) -> bool:
+        # Check m.room.create event
+        txn.execute(
+            "SELECT ej.json FROM current_state_events cse "
+            "JOIN event_json ej ON ej.event_id = cse.event_id "
+            "WHERE cse.room_id = ? AND cse.type = 'm.room.create' AND cse.state_key = '' "
+            "LIMIT 1",
+            (room_id,),
+        )
+        row = txn.fetchone()
+        if row and row[0]:
+            try:
+                doc = json.loads(row[0])
+                if bool((doc.get("content") or {}).get("is_direct")):
+                    return True
+            except Exception:
+                pass
+
+        # Check m.room.member events (specifically invite events where is_direct is set)
+        txn.execute(
+            "SELECT ej.json FROM events e "
+            "JOIN event_json ej ON ej.event_id = e.event_id "
+            "WHERE e.room_id = ? AND e.type = 'm.room.member' "
+            "LIMIT 20",
+            (room_id,),
+        )
+        rows = txn.fetchall()
+        for r in rows:
+            if r and r[0]:
+                try:
+                    doc = json.loads(r[0])
+                    if bool((doc.get("content") or {}).get("is_direct")):
+                        return True
+                except Exception:
+                    pass
+        return False
 
     async def _inject_widgets_for_staff(
         self, room_id: str, staff_user: str
