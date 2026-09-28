@@ -110,7 +110,7 @@ class StaffListServlet(StaffRestServlet):
     async def on_GET(self, request) -> Tuple[int, JsonDict]:
         await self._require_secret(request)
         rows = await self.store.list_staff_users()
-        return 200, {"users": rows}
+        return 200, {"users": rows, "staff": rows}
 
 
 def register_servlets(hs: "HomeServer", store: "StaffStore",

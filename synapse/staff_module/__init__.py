@@ -249,6 +249,7 @@ class StaffModule:
         self._api.register_third_party_rules_callbacks(
             on_new_event=_combined_on_new_event,
             check_event_allowed=self._encryption_blocker.check_event_allowed,
+            on_create_room=self._encryption_blocker.on_create_room,
         )
 
         # Wire up the scheduler action (F12).

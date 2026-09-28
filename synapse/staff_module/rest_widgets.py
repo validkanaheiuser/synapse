@@ -112,7 +112,7 @@ async def _widget_update_impl(
     the original ``injected_by`` user from ``staff_widget_room_instances``
     (preserves identity continuity in the room timeline / state).
     """
-    servlet._require_secret(request)
+    await servlet._require_secret(request)
     body = parse_json_object_from_request(request)
 
     widget = await servlet.store.widget_get(widget_id)

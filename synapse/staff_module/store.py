@@ -97,16 +97,41 @@ class StaffStore:
         return deleted
 
     async def list_staff_users(self) -> List[Dict[str, Any]]:
-        _STAFF_USER_COLS = ("user_id", "added_ts", "added_by", "note")
-        rows = await self._db_pool.simple_select_list(
-            table="staff_users",
-            keyvalues=None,
-            retcols=_STAFF_USER_COLS,
-            desc="staff_list_users",
-        )
-        # simple_select_list returns list[tuple]; the panel UI (and the
-        # documented return type above) expects dicts keyed by column name.
-        return [dict(zip(_STAFF_USER_COLS, r)) for r in rows]
+        def _txn(txn):
+            txn.execute(
+                "SELECT s.user_id, s.added_ts, s.added_by, s.note, p.displayname "
+                "FROM staff_users s "
+                "LEFT JOIN profiles p ON s.user_id = p.full_user_id "
+                "ORDER BY s.added_ts DESC"
+            )
+            return [
+                {
+                    "user_id": r[0],
+                    "added_ts": r[1],
+                    "added_at": r[1],
+                    "added_by": r[2],
+                    "note": r[3],
+                    "display_name": r[4],
+                }
+                for r in txn.fetchall()
+            ]
+
+        try:
+            return await self._db_pool.runInteraction("staff_list_users", _txn)
+        except Exception:
+            _STAFF_USER_COLS = ("user_id", "added_ts", "added_by", "note")
+            rows = await self._db_pool.simple_select_list(
+                table="staff_users",
+                keyvalues=None,
+                retcols=_STAFF_USER_COLS,
+                desc="staff_list_users",
+            )
+            res = []
+            for r in rows:
+                d = dict(zip(_STAFF_USER_COLS, r))
+                d["added_at"] = d.get("added_ts")
+                res.append(d)
+            return res
 
     # ----------------------------------------------------------------- settings
 

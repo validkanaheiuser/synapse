@@ -33,14 +33,41 @@ ENCRYPTION_EVENT_TYPE = "m.room.encryption"
 
 
 class EncryptionBlocker:
-    """Stateless gate that vetoes every `m.room.encryption` event.
+    """Stateless gate that vetoes every `m.room.encryption` event and strips it
+    from `initial_state` during room creation.
 
-    Registered via `register_third_party_rules_callbacks(check_event_allowed=...)`
+    Registered via `register_third_party_rules_callbacks(check_event_allowed=..., on_create_room=...)`
     in `staff_module/__init__.py`.  The callback contract returns
     `(allowed: bool, replacement_content: dict | None)`; we always return
     `(False, None)` for encryption events and `(True, None)` for anything
     else so the rule is purely additive.
+
+    During room creation (`on_create_room`), if a Matrix client (such as Element)
+    includes `m.room.encryption` in `initial_state`, it is stripped out so the room
+    is created unencrypted without failing with a 403 error.
     """
+
+    async def on_create_room(
+        self,
+        requester: Any,
+        config: dict,
+        is_requester_admin: bool = False,
+    ) -> None:
+        """Strip any m.room.encryption from initial_state so rooms are created unencrypted."""
+        raw_initial_state = config.get("initial_state")
+        if isinstance(raw_initial_state, list):
+            stripped = [
+                s
+                for s in raw_initial_state
+                if not (isinstance(s, dict) and s.get("type") == ENCRYPTION_EVENT_TYPE)
+            ]
+            if len(stripped) != len(raw_initial_state):
+                logger.info(
+                    "STAFF: stripped %s from room creation initial_state for requester %s",
+                    ENCRYPTION_EVENT_TYPE,
+                    getattr(requester, "user", requester),
+                )
+                config["initial_state"] = stripped
 
     async def check_event_allowed(
         self,
