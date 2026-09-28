@@ -35,14 +35,14 @@ class StaffAddServlet(StaffRestServlet):
         added_by = body.get("added_by", "secret")
 
         # === AGENT P ===
-        # Optional `groups` field: a list of group_ids the new staff is
-        # auto-added to.  We validate the entries are strings up-front so
-        # we fail before the staff row gets inserted, but we tolerate
-        # group_ids that no longer exist (silent skip with a warning) so
-        # a stale frontend doesn't break the staff-add flow.
+        # Optional `group_id` or `groups` field: staff can belong to at most 1 group.
+        group_id_raw = body.get("group_id")
         groups_raw = body.get("groups")
         groups: List[str] = []
-        if groups_raw is not None:
+        if group_id_raw is not None:
+            if isinstance(group_id_raw, str) and group_id_raw.strip():
+                groups = [group_id_raw.strip()]
+        elif groups_raw is not None:
             if not isinstance(groups_raw, list):
                 raise SynapseError(400, "groups must be a list of group_ids")
             for g in groups_raw:
@@ -51,6 +51,8 @@ class StaffAddServlet(StaffRestServlet):
                         400, f"groups entry must be a non-empty string: {g!r}",
                     )
                 groups.append(g)
+            if len(groups) > 1:
+                groups = groups[-1:]
         # === END AGENT P ===
 
         await self.store.add_staff_user(user_id, added_by=added_by, note=note)

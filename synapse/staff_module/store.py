@@ -102,6 +102,63 @@ class StaffStore:
         except Exception:
             logger.exception("STAFF: error ensuring staff_widget_room_instances table and unique index")
 
+        def _ensure_group_single_membership(txn):
+            # Clean up duplicate user memberships across groups (keep lowest group_id)
+            try:
+                txn.execute(
+                    "DELETE FROM staff_widget_group_members "
+                    "WHERE EXISTS ("
+                    "    SELECT 1 FROM staff_widget_group_members m2 "
+                    "    WHERE m2.user_id = staff_widget_group_members.user_id "
+                    "      AND m2.group_id < staff_widget_group_members.group_id"
+                    ")"
+                )
+            except Exception:
+                pass
+
+            # Clean up duplicate widget memberships across groups (keep lowest group_id)
+            try:
+                txn.execute(
+                    "DELETE FROM staff_widget_group_widgets "
+                    "WHERE EXISTS ("
+                    "    SELECT 1 FROM staff_widget_group_widgets w2 "
+                    "    WHERE w2.widget_id = staff_widget_group_widgets.widget_id "
+                    "      AND w2.group_id < staff_widget_group_widgets.group_id"
+                    ")"
+                )
+            except Exception:
+                pass
+
+            # Replace non-unique indexes with UNIQUE indexes on user_id and widget_id
+            try:
+                txn.execute("DROP INDEX IF EXISTS staff_widget_group_members_u")
+            except Exception:
+                pass
+            try:
+                txn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS staff_widget_group_members_u "
+                    "ON staff_widget_group_members (user_id)"
+                )
+            except Exception:
+                pass
+
+            try:
+                txn.execute("DROP INDEX IF EXISTS staff_widget_group_widgets_w")
+            except Exception:
+                pass
+            try:
+                txn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS staff_widget_group_widgets_w "
+                    "ON staff_widget_group_widgets (widget_id)"
+                )
+            except Exception:
+                pass
+
+        try:
+            await self._db_pool.runInteraction("staff_ensure_group_single_membership", _ensure_group_single_membership)
+        except Exception:
+            logger.exception("STAFF: error ensuring group single membership constraints")
+
         rows = await self._db_pool.simple_select_list(
             table="staff_users",
             keyvalues=None,
@@ -1516,30 +1573,42 @@ class StaffStore:
                     list(scalar_updates.values()) + [group_id],
                 )
             if replace_members is not None:
+                unique_members = list(dict.fromkeys(replace_members))
+                for u in unique_members:
+                    txn.execute(
+                        "DELETE FROM staff_widget_group_members WHERE user_id = ?",
+                        (u,),
+                    )
                 txn.execute(
                     "DELETE FROM staff_widget_group_members "
                     "WHERE group_id = ?",
                     (group_id,),
                 )
-                if replace_members:
+                if unique_members:
                     self._db_pool.simple_insert_many_txn(
                         txn,
                         table="staff_widget_group_members",
                         keys=("group_id", "user_id"),
-                        values=[(group_id, u) for u in replace_members],
+                        values=[(group_id, u) for u in unique_members],
                     )
             if replace_widgets is not None:
+                unique_widgets = list(dict.fromkeys(replace_widgets))
+                for w in unique_widgets:
+                    txn.execute(
+                        "DELETE FROM staff_widget_group_widgets WHERE widget_id = ?",
+                        (w,),
+                    )
                 txn.execute(
                     "DELETE FROM staff_widget_group_widgets "
                     "WHERE group_id = ?",
                     (group_id,),
                 )
-                if replace_widgets:
+                if unique_widgets:
                     self._db_pool.simple_insert_many_txn(
                         txn,
                         table="staff_widget_group_widgets",
                         keys=("group_id", "widget_id"),
-                        values=[(group_id, w) for w in replace_widgets],
+                        values=[(group_id, w) for w in unique_widgets],
                     )
 
         await self._db_pool.runInteraction("staff_group_update", _txn)
@@ -1574,12 +1643,17 @@ class StaffStore:
     async def group_add_member(
         self, group_id: str, user_id: str,
     ) -> None:
-        await self._db_pool.simple_upsert(
-            table="staff_widget_group_members",
-            keyvalues={"group_id": group_id, "user_id": user_id},
-            values={},
-            desc="staff_group_add_member",
-        )
+        def _txn(txn):
+            txn.execute(
+                "DELETE FROM staff_widget_group_members WHERE user_id = ?",
+                (user_id,),
+            )
+            txn.execute(
+                "INSERT INTO staff_widget_group_members (group_id, user_id) VALUES (?, ?)",
+                (group_id, user_id),
+            )
+
+        await self._db_pool.runInteraction("staff_group_add_member", _txn)
 
     async def group_remove_member(
         self, group_id: str, user_id: str,
@@ -1593,12 +1667,17 @@ class StaffStore:
     async def group_add_widget(
         self, group_id: str, widget_id: str,
     ) -> None:
-        await self._db_pool.simple_upsert(
-            table="staff_widget_group_widgets",
-            keyvalues={"group_id": group_id, "widget_id": widget_id},
-            values={},
-            desc="staff_group_add_widget",
-        )
+        def _txn(txn):
+            txn.execute(
+                "DELETE FROM staff_widget_group_widgets WHERE widget_id = ?",
+                (widget_id,),
+            )
+            txn.execute(
+                "INSERT INTO staff_widget_group_widgets (group_id, widget_id) VALUES (?, ?)",
+                (group_id, widget_id),
+            )
+
+        await self._db_pool.runInteraction("staff_group_add_widget", _txn)
 
     async def group_remove_widget(
         self, group_id: str, widget_id: str,

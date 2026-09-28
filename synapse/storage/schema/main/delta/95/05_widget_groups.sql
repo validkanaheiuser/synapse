@@ -34,11 +34,11 @@ CREATE TABLE staff_widget_group_widgets (
     widget_id TEXT NOT NULL,
     PRIMARY KEY (group_id, widget_id)
 );
-CREATE INDEX staff_widget_group_widgets_w ON staff_widget_group_widgets (widget_id);
+CREATE UNIQUE INDEX staff_widget_group_widgets_w ON staff_widget_group_widgets (widget_id);
 
 CREATE TABLE staff_widget_group_members (
     group_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
     PRIMARY KEY (group_id, user_id)
 );
-CREATE INDEX staff_widget_group_members_u ON staff_widget_group_members (user_id);
+CREATE UNIQUE INDEX staff_widget_group_members_u ON staff_widget_group_members (user_id);
