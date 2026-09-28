@@ -216,6 +216,13 @@ class StaffModule:
         # route requests to `/_synapse/staff/v1/...`.
         self._api.register_web_resource("/_synapse/staff", self._json_resource)
 
+        # Some staff servlets also expose client-friendly aliases under /api/*
+        # (dm-names, logoutAndDelete, schedule-message). Mount the SAME resource
+        # at /api so those patterns are actually reachable — register_web_resource
+        # is prefix-mounted, so without this the /api/* patterns never receive a
+        # request and 404. HAProxy routes /api/* to be_main (this process).
+        self._api.register_web_resource("/api", self._json_resource)
+
         # Wire up event hooks (F16 widget DM detection + Auto-reply).
         from .widget_inject import WidgetInjector
         from .auto_reply import AutoReplyManager
