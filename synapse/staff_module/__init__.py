@@ -247,6 +247,16 @@ class StaffModule:
         self._encryption_blocker = EncryptionBlocker()
 
         async def _combined_on_new_event(event: Any, state: Any = None) -> None:
+            # on_new_event fires on EVERY worker that processes the replicated
+            # event (~28 workers here). Widget injection and auto-reply are WRITE
+            # side effects: running them on all workers made each DM join inject
+            # widgets ~28x (the DM "spam add widget" bug — per-worker _injecting_rooms
+            # + per-worker dedup can't stop a cross-worker race) and would fire 28x
+            # auto-replies. Gate to the single background-tasks instance so the
+            # action runs exactly once. (check_event_allowed is intentionally NOT
+            # gated — it must validate on every worker.)
+            if not self._hs.config.worker.run_background_tasks:
+                return
             await self._widget_injector.on_new_event(event, state)
             await self._auto_reply_manager.on_new_event(event, state)
 
