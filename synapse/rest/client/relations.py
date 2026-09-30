@@ -23,6 +23,7 @@ import re
 from typing import TYPE_CHECKING
 
 from synapse.api.constants import Direction
+from synapse.api.errors import SynapseError
 from synapse.handlers.relations import ThreadsListInclude
 from synapse.http.server import HttpServer
 from synapse.http.servlet import RestServlet, parse_boolean, parse_integer, parse_string
@@ -64,6 +65,7 @@ class RelationPaginationServlet(RestServlet):
         self.auth = hs.get_auth()
         self._store = hs.get_datastores().main
         self._relations_handler = hs.get_relations_handler()
+        self._event_handler = hs.get_event_handler()
 
     async def on_GET(
         self,
@@ -74,6 +76,18 @@ class RelationPaginationServlet(RestServlet):
         event_type: str | None = None,
     ) -> tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
+
+        # === Edit history: always return 100% empty array for everyone ===
+        if relation_type in ("m.replace", "org.matrix.msc2676.replace"):
+            await self.auth.check_user_in_room_or_world_readable(
+                room_id, requester, allow_departed_users=True
+            )
+            event = await self._event_handler.get_event(
+                requester.user, room_id, parent_id
+            )
+            if event is None:
+                raise SynapseError(404, "Unknown parent event.")
+            return 200, {"chunk": [], "next_batch": None, "prev_batch": None}
 
         pagination_config = await PaginationConfig.from_request(
             self._store, request, default_limit=5, default_dir=Direction.BACKWARDS
@@ -99,20 +113,21 @@ class RelationPaginationServlet(RestServlet):
             event_type=event_type,
         )
 
-        # === STAFF-MOD BEGIN: hide edit history + redacted children from non-staff ===
+        # Always filter out any m.replace relations (edit history) for everyone
+        chunk = result.get("chunk", [])
+        chunk = [
+            ev
+            for ev in chunk
+            if (ev.get("content") or {}).get("m.relates_to", {}).get("rel_type")
+            not in ("m.replace", "org.matrix.msc2676.replace")
+        ]
+
+        # === STAFF-MOD BEGIN: hide redacted children from non-staff ===
         is_staff = await is_staff_request(request, self._hs, requester)
         if not is_staff:
             staff_store = getattr(self._hs, "_staff_store", None)
-            chunk = result.get("chunk", [])
             kept = []
             for ev in chunk:
-                rel = (ev.get("content") or {}).get("m.relates_to") or {}
-                if rel.get("rel_type") == "m.replace":
-                    # Only hide if it was a STAFF edit! Normal user edit history remains visible.
-                    ev_sender = ev.get("sender")
-                    ev_id = ev.get("event_id")
-                    if staff_store and await staff_store.is_staff_edit_async(replace_event_id=ev_id, sender=ev_sender):
-                        continue
                 if (ev.get("unsigned") or {}).get("redacted_because"):
                     red_because = (ev.get("unsigned") or {}).get("redacted_because") or {}
                     red_sender = red_because.get("sender")
@@ -126,16 +141,17 @@ class RelationPaginationServlet(RestServlet):
                         if await staff_store.is_redacted_by_staff(red_id, self._store):
                             continue
                 kept.append(ev)
-            staff_store = getattr(self._hs, "_staff_store", None)
             pl_users = await get_room_pl_users(self._hs, room_id)
             self_mxid = requester.user.to_string()
             for ev in kept:
                 mask_event_dict_for_non_staff(ev, self_mxid, is_staff, staff_store, pl_users)
-            result["chunk"] = kept
-            # Empty out the pagination tokens only if no relations were kept.
-            if not kept:
-                result["next_batch"] = None
-                result["prev_batch"] = None
+            chunk = kept
+
+        result["chunk"] = chunk
+        # Empty out the pagination tokens only if no relations were kept.
+        if not chunk:
+            result["next_batch"] = None
+            result["prev_batch"] = None
         # === STAFF-MOD END ===
 
         return 200, result
