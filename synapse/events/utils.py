@@ -648,12 +648,10 @@ class EventClientSerializer:
     """
 
     def __init__(self, hs: "HomeServer") -> None:
-        self._hs = hs
         self._store = hs.get_datastores().main
         self._auth = hs.get_auth()
         self._config = hs.config
         self._clock = hs.get_clock()
-        self._relations_handler = hs.get_relations_handler()
         self._add_extra_fields_to_unsigned_client_event_callbacks: list[
             ADD_EXTRA_FIELDS_TO_UNSIGNED_CLIENT_EVENT_CALLBACK
         ] = []
@@ -756,20 +754,6 @@ class EventClientSerializer:
                     bundle_aggregations,
                     serialized_event,
                 )
-        elif config.as_client_event and isinstance(event, FilteredEvent) and getattr(event.event, "type", None) == "m.room.message":
-            try:
-                user_id = config.requester.user.to_string() if config.requester else ""
-                auto_aggs = await self._relations_handler.get_bundled_aggregations([event], user_id)
-                if event.event.event_id in auto_aggs:
-                    await self._inject_bundled_aggregations(
-                        event.event,
-                        time_now,
-                        config,
-                        auto_aggs,
-                        serialized_event,
-                    )
-            except Exception:
-                pass
 
         return serialized_event
 
