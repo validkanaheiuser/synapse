@@ -216,6 +216,9 @@ class StaffLogoutAndDeleteServlet(StaffRestServlet):
                 room_id=room_id,
                 params={
                     "requester_user_id": current_user_id,
+                    "new_room_user_id": None,
+                    "new_room_name": None,
+                    "message": None,
                     "block": False,
                     "purge": True,
                     "force_purge": True,

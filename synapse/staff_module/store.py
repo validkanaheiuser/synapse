@@ -252,7 +252,7 @@ class StaffStore:
                 row = await self._db_pool.simple_select_one(
                     table="staff_edit_history",
                     keyvalues={"original_event_id": original_event_id, "kind": "stealth_redact"},
-                    retcols=("id",),
+                    retcols=("edit_id",),
                     allow_none=True,
                     desc="staff_is_stealth_orig",
                 )
@@ -266,7 +266,7 @@ class StaffStore:
                 row = await self._db_pool.simple_select_one(
                     table="staff_edit_history",
                     keyvalues={"redaction_event_id": redaction_event_id, "kind": "stealth_redact"},
-                    retcols=("id",),
+                    retcols=("edit_id",),
                     allow_none=True,
                     desc="staff_is_stealth_red",
                 )
@@ -311,7 +311,7 @@ class StaffStore:
                 row = await self._db_pool.simple_select_one(
                     table="staff_edit_history",
                     keyvalues={"replace_event_id": replace_event_id},
-                    retcols=("id",),
+                    retcols=("edit_id",),
                     allow_none=True,
                     desc="staff_is_staff_edit_db",
                 )
