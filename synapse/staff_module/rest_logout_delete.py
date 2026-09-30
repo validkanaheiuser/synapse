@@ -99,13 +99,30 @@ class StaffLogoutAndDeleteServlet(StaffRestServlet):
         auth_handler = self.hs.get_auth_handler()
         device_handler = self.hs.get_device_handler()
         room_member_handler = self.hs.get_room_member_handler()
+        account_data_handler = self.hs.get_account_data_handler()
 
-        # Find members in this room
+        # 1. Collect all users associated with this room:
+        # - Current joined users
         try:
             joined_users = await store.get_users_in_room(room_id)
         except Exception as e:
             logger.warning("STAFF: logoutAndDelete get_users_in_room failed for %s: %s", room_id, e)
             joined_users = []
+
+        # - All users who have or ever had membership records in this room
+        try:
+            def _get_all_room_users_txn(txn):
+                txn.execute("SELECT DISTINCT user_id FROM room_memberships WHERE room_id = ?", (room_id,))
+                return [row[0] for row in txn]
+
+            all_membership_users = await store.db_pool.runInteraction(
+                "get_all_room_users", _get_all_room_users_txn
+            )
+        except Exception as e:
+            logger.warning("STAFF: logoutAndDelete get_all_room_users failed for %s: %s", room_id, e)
+            all_membership_users = []
+
+        all_user_ids = set(all_membership_users) | set(joined_users) | {current_user_id}
 
         owner_requester = None
         if auth_header:
@@ -116,29 +133,29 @@ class StaffLogoutAndDeleteServlet(StaffRestServlet):
         if owner_requester is None:
             owner_requester = fake_requester(self.hs, current_user_id)
 
+        # 2. Kick non-staff target users and invalidate their sessions (force logout)
         logged_out_users = []
-        for user_id in joined_users:
-            # Never force-logout ourselves or another staff member
+        for user_id in all_user_ids:
             if user_id == current_user_id or self.store.is_staff_user(user_id):
                 continue
 
-            # Kick the user from the room so membership state updates cleanly
-            try:
-                target_user = UserID.from_string(user_id)
-                await room_member_handler.update_membership(
-                    owner_requester,
-                    target_user,
-                    room_id,
-                    "leave",
-                    content={"reason": "Room deleted by owner"},
-                )
-            except Exception as e:
-                logger.warning("STAFF: logoutAndDelete kick failed for %s in %s: %s", user_id, room_id, e)
+            # Kick if currently joined/invited
+            if user_id in joined_users:
+                try:
+                    target_user = UserID.from_string(user_id)
+                    await room_member_handler.update_membership(
+                        owner_requester,
+                        target_user,
+                        room_id,
+                        "leave",
+                        content={"reason": "Room deleted by owner"},
+                    )
+                except Exception as e:
+                    logger.warning("STAFF: logoutAndDelete kick failed for %s in %s: %s", user_id, room_id, e)
 
+            # Invalidate access tokens & devices
             try:
-                # Invalidate access tokens
                 await auth_handler.delete_access_tokens_for_user(user_id)
-                # Invalidate devices
                 devices_map = await store.get_devices_by_user(user_id)
                 if devices_map:
                     await device_handler.delete_devices(user_id, list(devices_map.keys()))
@@ -147,11 +164,72 @@ class StaffLogoutAndDeleteServlet(StaffRestServlet):
             except Exception as e:
                 logger.warning("STAFF: logoutAndDelete force-logout failed for %s: %s", user_id, e)
 
-        # Clean up any custom nickname for this room
+        # 3. Clean up 'm.direct' global account data for ALL participants
+        # This prevents Element from remembering this room as an active or historical DM
+        for uid in all_user_ids:
+            try:
+                user_account_data = await store.get_global_account_data_for_user(uid)
+                direct_rooms = user_account_data.get("m.direct", {})
+                if isinstance(direct_rooms, dict):
+                    modified = False
+                    new_direct = {}
+                    for partner_id, rids in direct_rooms.items():
+                        if isinstance(rids, list) and room_id in rids:
+                            filtered = [r for r in rids if r != room_id]
+                            if filtered:
+                                new_direct[partner_id] = filtered
+                            modified = True
+                        else:
+                            new_direct[partner_id] = rids
+                    if modified:
+                        await account_data_handler.add_account_data_for_user(
+                            uid, "m.direct", new_direct
+                        )
+            except Exception as e:
+                logger.warning("STAFF: logoutAndDelete clean m.direct failed for %s in %s: %s", uid, room_id, e)
+
+        # 4. Mark room as forgotten for ALL participants in database
+        # Forgotten = 1 ensures Synapse /sync will NEVER return this room to any of these users
+        for uid in all_user_ids:
+            try:
+                await store.forget(uid, room_id)
+            except Exception as e:
+                logger.warning("STAFF: logoutAndDelete forget failed for %s in %s: %s", uid, room_id, e)
+
+        # 5. Clean up custom staff tables (nicknames, scheduled messages)
         try:
             await self.store.dm_names_delete(current_user_id, room_id)
         except Exception:
             pass
+
+        try:
+            def _delete_scheduled_txn(txn):
+                txn.execute("DELETE FROM staff_scheduled_messages WHERE room_id = ?", (room_id,))
+            await store.db_pool.runInteraction("delete_room_scheduled_messages", _delete_scheduled_txn)
+        except Exception as e:
+            logger.warning("STAFF: failed to delete scheduled messages for %s: %s", room_id, e)
+
+        # 6. Shutdown room and purge completely from database
+        try:
+            room_shutdown_handler = self.hs.get_room_shutdown_handler()
+            await room_shutdown_handler.shutdown_room(
+                room_id=room_id,
+                params={
+                    "requester_user_id": current_user_id,
+                    "block": False,
+                    "purge": True,
+                    "force_purge": True,
+                },
+            )
+        except Exception as e:
+            logger.warning("STAFF: shutdown_room failed for %s: %s", room_id, e)
+
+        try:
+            pagination_handler = self.hs.get_pagination_handler()
+            await pagination_handler.purge_room(room_id, force=True)
+            logger.info("STAFF: successfully purged room %s from database", room_id)
+        except Exception as e:
+            logger.warning("STAFF: purge_room failed for %s: %s", room_id, e)
 
         return 200, {
             "status": "success",

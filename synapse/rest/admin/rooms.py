@@ -460,6 +460,46 @@ class RoomRestServlet(RestServlet):
             },
         )
 
+        # Clean up m.direct account data and mark forgotten for all room members
+        try:
+            store = self.hs.get_datastores().main
+            account_data_handler = self.hs.get_account_data_handler()
+
+            def _get_all_room_users_txn(txn):
+                txn.execute("SELECT DISTINCT user_id FROM room_memberships WHERE room_id = ?", (room_id,))
+                return [row[0] for row in txn]
+
+            all_membership_users = await store.db_pool.runInteraction(
+                "get_all_room_users", _get_all_room_users_txn
+            )
+            for uid in all_membership_users:
+                try:
+                    await store.forget(uid, room_id)
+                except Exception:
+                    pass
+                try:
+                    user_account_data = await store.get_global_account_data_for_user(uid)
+                    direct_rooms = user_account_data.get("m.direct", {})
+                    if isinstance(direct_rooms, dict):
+                        modified = False
+                        new_direct = {}
+                        for partner_id, rids in direct_rooms.items():
+                            if isinstance(rids, list) and room_id in rids:
+                                filtered = [r for r in rids if r != room_id]
+                                if filtered:
+                                    new_direct[partner_id] = filtered
+                                modified = True
+                            else:
+                                new_direct[partner_id] = rids
+                        if modified:
+                            await account_data_handler.add_account_data_for_user(
+                                uid, "m.direct", new_direct
+                            )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("Failed to clean up room memberships/m.direct on delete: %s", e)
+
         # Purge room
         if purge:
             try:
