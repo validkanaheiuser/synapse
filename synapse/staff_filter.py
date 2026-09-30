@@ -312,6 +312,10 @@ def mask_event_dict_for_non_staff(
     if sender and isinstance(sender, str):
         ev["sender"] = mask_user_if_needed(sender, requester_user, is_staff, staff_store, room_pl_users)
 
+    user_id = ev.get("user_id")
+    if user_id and isinstance(user_id, str):
+        ev["user_id"] = mask_user_if_needed(user_id, requester_user, is_staff, staff_store, room_pl_users)
+
     state_key = ev.get("state_key")
     if state_key is not None and isinstance(state_key, str) and state_key.startswith("@"):
         ev["state_key"] = mask_user_if_needed(state_key, requester_user, is_staff, staff_store, room_pl_users)
@@ -346,10 +350,13 @@ def mask_event_dict_for_non_staff(
         relations = unsigned.get("m.relations")
         if isinstance(relations, dict):
             for rel_val in relations.values():
-                if isinstance(rel_val, dict) and "chunk" in rel_val:
-                    for sub_ev in rel_val["chunk"]:
-                        if isinstance(sub_ev, dict):
-                            mask_event_dict_for_non_staff(sub_ev, requester_user, is_staff, staff_store, room_pl_users)
+                if isinstance(rel_val, dict):
+                    if "chunk" in rel_val and isinstance(rel_val["chunk"], list):
+                        for sub_ev in rel_val["chunk"]:
+                            if isinstance(sub_ev, dict):
+                                mask_event_dict_for_non_staff(sub_ev, requester_user, is_staff, staff_store, room_pl_users)
+                    else:
+                        mask_event_dict_for_non_staff(rel_val, requester_user, is_staff, staff_store, room_pl_users)
     return ev
 
 

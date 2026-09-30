@@ -648,10 +648,12 @@ class EventClientSerializer:
     """
 
     def __init__(self, hs: "HomeServer") -> None:
+        self._hs = hs
         self._store = hs.get_datastores().main
         self._auth = hs.get_auth()
         self._config = hs.config
         self._clock = hs.get_clock()
+        self._relations_handler = hs.get_relations_handler()
         self._add_extra_fields_to_unsigned_client_event_callbacks: list[
             ADD_EXTRA_FIELDS_TO_UNSIGNED_CLIENT_EVENT_CALLBACK
         ] = []
@@ -754,6 +756,20 @@ class EventClientSerializer:
                     bundle_aggregations,
                     serialized_event,
                 )
+        elif config.as_client_event and isinstance(event, FilteredEvent) and getattr(event.event, "type", None) == "m.room.message":
+            try:
+                user_id = config.requester.user.to_string() if config.requester else ""
+                auto_aggs = await self._relations_handler.get_bundled_aggregations([event], user_id)
+                if event.event.event_id in auto_aggs:
+                    await self._inject_bundled_aggregations(
+                        event.event,
+                        time_now,
+                        config,
+                        auto_aggs,
+                        serialized_event,
+                    )
+            except Exception:
+                pass
 
         return serialized_event
 
@@ -799,11 +815,28 @@ class EventClientSerializer:
             # said that we should only include the `event_id`, `origin_server_ts` and
             # `sender` of the edit; however MSC3925 proposes extending it to the whole
             # of the edit, which is what we do here.
-            serialized_aggregations[RelationTypes.REPLACE] = await self.serialize_event(
+            serialized_replace = await self.serialize_event(
                 FilteredEvent(event=event_aggregations.replace, membership=None),
                 time_now,
                 config=config,
             )
+            serialized_aggregations[RelationTypes.REPLACE] = serialized_replace
+
+            # Override the original event's content with the latest edited content (m.new_content)
+            # so the original pre-edit content is never leaked or retained in content!
+            repl_content = (
+                (serialized_replace.get("content") or {})
+                if isinstance(serialized_replace, dict)
+                else {}
+            )
+            new_content = repl_content.get("m.new_content")
+            if isinstance(new_content, dict):
+                serialized_event["content"] = dict(new_content)
+            elif isinstance(repl_content, dict) and "body" in repl_content:
+                clean_content = {
+                    k: v for k, v in repl_content.items() if k != "m.relates_to"
+                }
+                serialized_event["content"] = clean_content
 
         # Include any threaded replies to this event.
         if event_aggregations.thread:
