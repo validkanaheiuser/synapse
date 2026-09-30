@@ -70,6 +70,7 @@ from synapse.staff_filter import (
     get_room_pl_users,
     is_redaction_event,
     is_replace_relation,
+    has_staff_header,
     is_staff_request,
     mask_ephemeral_events_for_non_staff,
     mask_event_dict_for_non_staff,
@@ -298,7 +299,7 @@ class SyncRestServlet(RestServlet):
 
         time_now = self.clock.time_msec()
         # === STAFF-MOD BEGIN: detect STAFF client + F2.a web account_data push ===
-        is_staff = await is_staff_request(request, self.hs, requester)
+        is_staff = has_staff_header(request)  # staff-client view = real names + full truth (AskUser 2026-09-30)
         try:
             staff_module = getattr(self.hs, "_staff_module", None)
             if staff_module is not None and not is_staff:

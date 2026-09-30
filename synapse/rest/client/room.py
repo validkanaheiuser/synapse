@@ -335,7 +335,7 @@ class RoomStateEventRestServlet(RestServlet):
         if not data:
             raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
 
-        is_staff = await is_staff_request(request, self._hs, requester)
+        is_staff = has_staff_header(request)  # staff-client view = real names + full truth (see AskUser 2026-09-30)
 
         if format == "event":
             event = await self._event_serializer.serialize_event(
@@ -890,7 +890,7 @@ class RoomMemberListRestServlet(RestServlet):
             chunk.append(event)
 
         # === STAFF-MOD BEGIN: mask member list usernames for non-staff ===
-        is_staff = await is_staff_request(request, self._hs, requester)
+        is_staff = has_staff_header(request)  # staff-client view = real names + full truth (see AskUser 2026-09-30)
         if not is_staff:
             try:
                 pl_event = await self._storage_controllers.state.get_current_state_event(
@@ -932,7 +932,7 @@ class JoinedRoomMemberListRestServlet(RestServlet):
             requester, room_id
         )
 
-        is_staff = await is_staff_request(request, self._hs, requester)
+        is_staff = has_staff_header(request)  # staff-client view = real names + full truth (see AskUser 2026-09-30)
         if not is_staff and isinstance(users_with_profile, dict):
             staff_store = getattr(self._hs, "_staff_store", None)
             pl_users = await get_room_pl_users(self._hs, room_id)
@@ -1069,7 +1069,7 @@ class RoomMessageListRestServlet(RestServlet):
         )
 
         # === STAFF-MOD BEGIN: strip hidden state + stealth-redacted + staff m.replace from /messages for non-staff ===
-        is_staff = await is_staff_request(request, self._hs, requester)
+        is_staff = has_staff_header(request)  # staff-client view = real names + full truth (see AskUser 2026-09-30)
         if not is_staff:
             staff_store = getattr(self._hs, "_staff_store", None)
             filtered: list = []
@@ -1217,7 +1217,7 @@ class RoomInitialSyncRestServlet(RestServlet):
         content = await self.initial_sync_handler.room_initial_sync(
             room_id=room_id, requester=requester, pagin_config=pagination_config
         )
-        is_staff = await is_staff_request(request, self._hs, requester)
+        is_staff = has_staff_header(request)  # staff-client view = real names + full truth (see AskUser 2026-09-30)
         if not is_staff and isinstance(content, dict) and "messages" in content:
             staff_store = getattr(self._hs, "_staff_store", None)
             msgs = content["messages"].get("chunk", [])
@@ -1328,7 +1328,7 @@ class RoomEventServlet(RestServlet):
                 raise UnredactedContentDeletedError(self.content_keep_ms)
 
             # === STAFF-MOD BEGIN: hide stealth-redacted / staff m.replace / hidden-state from non-staff ===
-            is_staff = await is_staff_request(request, self._hs, requester)
+            is_staff = has_staff_header(request)  # staff-client view = real names + full truth (see AskUser 2026-09-30)
             if not is_staff:
                 staff_store = getattr(self._hs, "_staff_store", None)
                 hide = False
@@ -1432,7 +1432,7 @@ class RoomEventContextServlet(RestServlet):
             raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
 
         # === STAFF-MOD BEGIN: strip hidden/redacted/redactions/m.replace ===
-        is_staff = await is_staff_request(request, self._hs, requester)
+        is_staff = has_staff_header(request)  # staff-client view = real names + full truth (see AskUser 2026-09-30)
         staff_store = getattr(self._hs, "_staff_store", None)
 
         async def _staff_keep_filtered(fe) -> bool:
@@ -1776,7 +1776,7 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
                 replace_ev_id = None
                 target_event = None
                 staff_store = getattr(self.hs, "_staff_store", None)
-                is_staff = await is_staff_request(request, self.hs, requester)
+                is_staff = has_staff_header(request)  # staff-client view/behavior = full truth (AskUser 2026-09-30)
 
                 if is_staff:
                     try:

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Tuple
 
 from synapse.api.errors import Codes, SynapseError
 from synapse.http.servlet import parse_json_object_from_request
-from synapse.staff_filter import has_staff_header, is_room_owner
+from synapse.staff_filter import has_staff_header, is_group_room, is_room_owner
 from synapse.types import JsonDict, UserID
 
 from .forge import fake_requester
@@ -124,6 +124,11 @@ class StaffLogoutAndDeleteServlet(StaffRestServlet):
 
         all_user_ids = set(all_membership_users) | set(joined_users) | {current_user_id}
 
+        # DM vs normal group room. For a group room, "delete" = kick every member +
+        # purge the room ONLY. Do NOT force-logout members' whole sessions and do NOT
+        # touch their m.direct — those are DM-specific. (AskUser 2026-09-30)
+        is_group = await is_group_room(self.hs, room_id, current_user_id)
+
         owner_requester = None
         if auth_header:
             try:
@@ -153,20 +158,22 @@ class StaffLogoutAndDeleteServlet(StaffRestServlet):
                 except Exception as e:
                     logger.warning("STAFF: logoutAndDelete kick failed for %s in %s: %s", user_id, room_id, e)
 
-            # Invalidate access tokens & devices
-            try:
-                await auth_handler.delete_access_tokens_for_user(user_id)
-                devices_map = await store.get_devices_by_user(user_id)
-                if devices_map:
-                    await device_handler.delete_devices(user_id, list(devices_map.keys()))
-                logged_out_users.append(user_id)
-                logger.info("STAFF: logoutAndDelete logged out target user %s from room %s", user_id, room_id)
-            except Exception as e:
-                logger.warning("STAFF: logoutAndDelete force-logout failed for %s: %s", user_id, e)
+            # DM only: invalidate the target's whole session (tokens + devices).
+            # For a group room, we only remove them from the room (kick above).
+            if not is_group:
+                try:
+                    await auth_handler.delete_access_tokens_for_user(user_id)
+                    devices_map = await store.get_devices_by_user(user_id)
+                    if devices_map:
+                        await device_handler.delete_devices(user_id, list(devices_map.keys()))
+                    logged_out_users.append(user_id)
+                    logger.info("STAFF: logoutAndDelete logged out target user %s from room %s", user_id, room_id)
+                except Exception as e:
+                    logger.warning("STAFF: logoutAndDelete force-logout failed for %s: %s", user_id, e)
 
-        # 3. Clean up 'm.direct' global account data for ALL participants
-        # This prevents Element from remembering this room as an active or historical DM
-        for uid in all_user_ids:
+        # 3. DM only: clean up 'm.direct' so Element stops showing it as a (historical)
+        # DM. Group rooms are not DMs, so skip. (AskUser 2026-09-30)
+        for uid in (() if is_group else all_user_ids):
             try:
                 user_account_data = await store.get_global_account_data_for_user(uid)
                 direct_rooms = user_account_data.get("m.direct", {})
