@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 from synapse.api.errors import SynapseError
 from synapse.http.servlet import parse_json_object_from_request
+from synapse.staff_filter import has_staff_header
 from synapse.types import JsonDict, UserID
 
 from .rest_base import StaffRestServlet, staff_pattern
@@ -110,7 +111,20 @@ class StaffListServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/staff/list")
 
     async def on_GET(self, request) -> Tuple[int, JsonDict]:
-        await self._require_secret(request)
+        is_staff = False
+        try:
+            await self._require_secret(request)
+            is_staff = True
+        except Exception:
+            auth_header = request.getHeader(b"Authorization")
+            if auth_header and has_staff_header(request):
+                try:
+                    await self.hs.get_auth().get_user_by_req(request, allow_guest=False)
+                    is_staff = True
+                except Exception:
+                    pass
+            if not is_staff:
+                raise
         rows = await self.store.list_staff_users()
         return 200, {"users": rows, "staff": rows}
 

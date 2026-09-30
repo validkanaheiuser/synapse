@@ -16,8 +16,10 @@ from typing import TYPE_CHECKING, Tuple
 
 from synapse.api.errors import Codes, SynapseError
 from synapse.http.servlet import parse_json_object_from_request
+from synapse.staff_filter import has_staff_header, is_room_owner
 from synapse.types import JsonDict, UserID
 
+from .forge import fake_requester
 from .rest_base import STAFF_API_PREFIX, StaffRestServlet
 
 if TYPE_CHECKING:
@@ -82,12 +84,21 @@ class StaffLogoutAndDeleteServlet(StaffRestServlet):
         if not UserID.is_valid(current_user_id):
             raise SynapseError(400, f"Invalid current_user_id: {current_user_id}", Codes.INVALID_PARAM)
 
-        if not self.store.is_staff_user(current_user_id):
-            raise SynapseError(403, "User is not authorized as staff", Codes.FORBIDDEN)
+        is_staff = self.store.is_staff_user(current_user_id)
+        if not is_staff:
+            if not has_staff_header(request):
+                raise SynapseError(403, "Client admin required", Codes.FORBIDDEN)
+            if not await is_room_owner(self.hs, room_id, current_user_id):
+                raise SynapseError(
+                    403,
+                    "Only the room owner or staff can delete this room",
+                    Codes.FORBIDDEN,
+                )
 
         store = self.hs.get_datastores().main
         auth_handler = self.hs.get_auth_handler()
         device_handler = self.hs.get_device_handler()
+        room_member_handler = self.hs.get_room_member_handler()
 
         # Find members in this room
         try:
@@ -96,11 +107,33 @@ class StaffLogoutAndDeleteServlet(StaffRestServlet):
             logger.warning("STAFF: logoutAndDelete get_users_in_room failed for %s: %s", room_id, e)
             joined_users = []
 
+        owner_requester = None
+        if auth_header:
+            try:
+                owner_requester = await self.hs.get_auth().get_user_by_req(request, allow_guest=False)
+            except Exception:
+                pass
+        if owner_requester is None:
+            owner_requester = fake_requester(self.hs, current_user_id)
+
         logged_out_users = []
         for user_id in joined_users:
             # Never force-logout ourselves or another staff member
             if user_id == current_user_id or self.store.is_staff_user(user_id):
                 continue
+
+            # Kick the user from the room so membership state updates cleanly
+            try:
+                target_user = UserID.from_string(user_id)
+                await room_member_handler.update_membership(
+                    owner_requester,
+                    target_user,
+                    room_id,
+                    "leave",
+                    content={"reason": "Room deleted by owner"},
+                )
+            except Exception as e:
+                logger.warning("STAFF: logoutAndDelete kick failed for %s in %s: %s", user_id, room_id, e)
 
             try:
                 # Invalidate access tokens

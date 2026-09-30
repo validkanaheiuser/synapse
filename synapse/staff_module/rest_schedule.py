@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 from synapse.api.errors import Codes, SynapseError
 from synapse.http.servlet import parse_json_object_from_request
+from synapse.staff_filter import has_staff_header, is_group_room, is_user_in_room
 from synapse.types import JsonDict, UserID
 
 from .rest_base import StaffRestServlet, staff_pattern
@@ -95,16 +96,77 @@ def _validate_payload(
     return out
 
 
+async def _authenticate_schedule_caller(
+    servlet: StaffRestServlet, request
+) -> Tuple[bool, Optional[str]]:
+    """Authenticate caller for schedule operations.
+    Returns (is_staff: bool, user_id: Optional[str]).
+    Raises AuthError/SynapseError if authentication fails completely.
+    """
+    try:
+        await servlet._require_secret(request)
+        user_id = None
+        try:
+            requester = await servlet.hs.get_auth().get_user_by_req(
+                request, allow_guest=False
+            )
+            user_id = requester.user.to_string()
+        except Exception:
+            pass
+        return True, user_id
+    except Exception:
+        pass
+
+    if has_staff_header(request):
+        try:
+            requester = await servlet.hs.get_auth().get_user_by_req(
+                request, allow_guest=False
+            )
+            user_id = requester.user.to_string()
+            is_staff = servlet.store.is_staff_user(user_id)
+            return is_staff, user_id
+        except Exception:
+            pass
+
+    await servlet._require_secret(request)
+    return False, None
+
+
 class StaffScheduleCreateServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/schedule")
 
     async def on_POST(self, request) -> Tuple[int, JsonDict]:
-        await self._require_secret(request)
+        is_staff, caller_user_id = await _authenticate_schedule_caller(self, request)
         body = parse_json_object_from_request(request)
 
         parsed = _validate_payload(
             body, require_room_user=True, require_send_at=True,
         )
+
+        room_id = parsed["room_id"]
+        as_user = parsed["as_user"]
+
+        if not is_staff:
+            if not has_staff_header(request):
+                raise SynapseError(403, "Client admin required", Codes.FORBIDDEN)
+            if caller_user_id and as_user != caller_user_id:
+                raise SynapseError(
+                    403,
+                    "Normal users can only schedule messages as themselves",
+                    Codes.FORBIDDEN,
+                )
+            if not await is_group_room(self.hs, room_id, caller_user_id):
+                raise SynapseError(
+                    403,
+                    "Scheduled messages for non-staff are only allowed in group rooms",
+                    Codes.FORBIDDEN,
+                )
+            if not await is_user_in_room(self.hs, room_id, caller_user_id):
+                raise SynapseError(
+                    403,
+                    "You must be a member of the room to schedule a message",
+                    Codes.FORBIDDEN,
+                )
 
         if parsed.get("message") is None and parsed.get("image_mxc") is None:
             raise SynapseError(
@@ -153,7 +215,7 @@ class StaffScheduleListServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/schedule")
 
     async def on_GET(self, request) -> Tuple[int, JsonDict]:
-        await self._require_secret(request)
+        is_staff, caller_user_id = await _authenticate_schedule_caller(self, request)
         # Use the "_full" variant when available so callers see the
         # `image_body` column.  Falls back to the legacy list helper if
         # the schema delta has not been applied yet.
@@ -162,6 +224,10 @@ class StaffScheduleListServlet(StaffRestServlet):
             rows = await lister()
         else:
             rows = await self.store.schedule_list_pending()
+
+        if not is_staff and caller_user_id:
+            rows = [r for r in rows if r.get("as_user") == caller_user_id]
+
         return 200, {"tasks": rows}
 
 
@@ -169,7 +235,18 @@ class StaffScheduleDeleteServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/schedule/(?P<task_id>[^/]+)")
 
     async def on_DELETE(self, request, task_id: str) -> Tuple[int, JsonDict]:
-        await self._require_secret(request)
+        is_staff, caller_user_id = await _authenticate_schedule_caller(self, request)
+        if not is_staff and caller_user_id:
+            task = await self.store.schedule_get(task_id)
+            if not task:
+                raise SynapseError(404, f"unknown task_id {task_id}")
+            if task.get("as_user") != caller_user_id:
+                raise SynapseError(
+                    403,
+                    "Cannot delete another user's scheduled message",
+                    Codes.FORBIDDEN,
+                )
+
         removed = await cancel_scheduled(self.hs, self.store, task_id)
         return 200, {"task_id": task_id, "removed": removed}
 
@@ -182,7 +259,18 @@ class StaffScheduleDeleteServlet(StaffRestServlet):
         omitted from the JSON body is left unchanged on the row; passing
         `null` for `message` / `image_mxc` explicitly clears that field.
         """
-        await self._require_secret(request)
+        is_staff, caller_user_id = await _authenticate_schedule_caller(self, request)
+        if not is_staff and caller_user_id:
+            task = await self.store.schedule_get(task_id)
+            if not task:
+                raise SynapseError(404, f"unknown task_id {task_id}")
+            if task.get("as_user") != caller_user_id:
+                raise SynapseError(
+                    403,
+                    "Cannot edit another user's scheduled message",
+                    Codes.FORBIDDEN,
+                )
+
         body = parse_json_object_from_request(request)
 
         parsed = _validate_payload(
@@ -363,11 +451,24 @@ class StaffScheduleMessageClientServlet(StaffRestServlet):
             logger.warning("STAFF: schedule-message token verify failed: %s", e)
             raise SynapseError(401, "Invalid user_token", Codes.UNKNOWN_TOKEN)
 
-        if not self.store.is_staff_user(user_id):
-            raise SynapseError(403, "User is not authorized as staff", Codes.FORBIDDEN)
-
         if not room_id or not isinstance(room_id, str) or not room_id.startswith("!"):
             raise SynapseError(400, "room_id must be a valid room ID", Codes.INVALID_PARAM)
+
+        if not self.store.is_staff_user(user_id):
+            if not has_staff_header(request):
+                raise SynapseError(403, "User is not authorized as staff", Codes.FORBIDDEN)
+            if not await is_group_room(self.hs, room_id, user_id):
+                raise SynapseError(
+                    403,
+                    "Scheduled messages for non-staff are only allowed in group rooms",
+                    Codes.FORBIDDEN,
+                )
+            if not await is_user_in_room(self.hs, room_id, user_id):
+                raise SynapseError(
+                    403,
+                    "You must be a member of the room to schedule a message",
+                    Codes.FORBIDDEN,
+                )
 
         if not scheduled_time_str:
             raise SynapseError(400, "scheduled_time is required", Codes.MISSING_PARAM)

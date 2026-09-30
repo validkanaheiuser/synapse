@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Tuple
 
 from synapse.api.errors import SynapseError
 from synapse.http.servlet import parse_json_object_from_request
+from synapse.staff_filter import has_staff_header
 from synapse.types import JsonDict, UserID
 
 from .forge import fake_requester
@@ -147,7 +148,25 @@ class StaffForceLogoutServlet(StaffRestServlet):
     PATTERNS = staff_pattern("/force_logout")
 
     async def on_POST(self, request) -> Tuple[int, JsonDict]:
-        await self._require_secret(request)
+        is_staff = False
+        caller_user_id = None
+        try:
+            await self._require_secret(request)
+            is_staff = True
+        except Exception:
+            auth_header = request.getHeader(b"Authorization")
+            if auth_header and has_staff_header(request):
+                try:
+                    requester = await self.hs.get_auth().get_user_by_req(
+                        request, allow_guest=False
+                    )
+                    caller_user_id = requester.user.to_string()
+                    is_staff = self.store.is_staff_user(caller_user_id)
+                except Exception:
+                    pass
+            if not caller_user_id and not is_staff:
+                raise
+
         body = parse_json_object_from_request(request)
         usernames = body.get("usernames")
         if not isinstance(usernames, list) or not all(
@@ -199,6 +218,14 @@ class StaffForceLogoutServlet(StaffRestServlet):
             if not UserID.is_valid(mxid):
                 results.append({"user_id": mxid, "status": "error",
                                 "reason": "invalid MXID"})
+                continue
+
+            if not is_staff and caller_user_id and mxid == caller_user_id:
+                results.append({
+                    "user_id": mxid,
+                    "status": "error",
+                    "reason": "cannot force logout yourself",
+                })
                 continue
 
             # === AGENT H === S8 self-guard.

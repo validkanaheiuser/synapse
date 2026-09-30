@@ -9,7 +9,11 @@
 #
 
 import hashlib
+import json
+import logging
 from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Iterable, List, Optional
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -415,3 +419,133 @@ async def get_room_pl_users(hs: "HomeServer", room_id: str) -> dict:
     except Exception:
         pass
     return {}
+
+
+async def is_room_owner(hs: "HomeServer", room_id: str, user_id: str) -> bool:
+    """Check if user_id is the room owner / trưởng nhóm.
+    A user is the room owner if:
+    1. They are the creator of the room (from m.room.create), OR
+    2. They have power level >= 100 in m.room.power_levels.
+    """
+    if not room_id or not user_id:
+        return False
+    try:
+        storage_controllers = getattr(hs, "get_storage_controllers", None)
+        if not storage_controllers:
+            return False
+        state_handler = storage_controllers().state
+
+        # Check m.room.power_levels:
+        pl_event = await state_handler.get_current_state_event(
+            room_id, "m.room.power_levels", ""
+        )
+        if pl_event and pl_event.content:
+            users = pl_event.content.get("users") or {}
+            user_pl = users.get(user_id)
+            if user_pl is not None:
+                try:
+                    if int(user_pl) >= 100:
+                        return True
+                except (ValueError, TypeError):
+                    pass
+
+        # Check m.room.create:
+        create_event = await state_handler.get_current_state_event(
+            room_id, "m.room.create", ""
+        )
+        if create_event:
+            creator = (create_event.content or {}).get("creator") or create_event.sender
+            if creator == user_id:
+                return True
+    except Exception as e:
+        logger.warning("Error checking is_room_owner for %s in %s: %s", user_id, room_id, e)
+    return False
+
+
+async def is_user_in_room(hs: "HomeServer", room_id: str, user_id: str) -> bool:
+    """Check if user_id is currently a joined member in room_id."""
+    if not room_id or not user_id:
+        return False
+    try:
+        main_store = hs.get_datastores().main
+        members = await main_store.get_users_in_room(room_id)
+        return user_id in members
+    except Exception:
+        return False
+
+
+async def is_group_room(hs: "HomeServer", room_id: str, user_id: Optional[str] = None) -> bool:
+    """Determine whether a room is a group room (nhóm) rather than a direct message (DM).
+
+    A room is a group room if:
+    1. It has more than 2 members, OR
+    2. It has an explicit m.room.name set, OR
+    3. It is NOT marked as a DM via m.direct account data or is_direct flags.
+    """
+    if not room_id:
+        return False
+    try:
+        main_store = hs.get_datastores().main
+        members = await main_store.get_users_in_room(room_id)
+        if len(members) > 2:
+            return True
+
+        # Check m.room.name
+        state_handler = hs.get_storage_controllers().state
+        name_ev = await state_handler.get_current_state_event(room_id, "m.room.name", "")
+        if name_ev and (name_ev.content or {}).get("name"):
+            return True
+
+        # Check m.room.create for is_direct
+        create_ev = await state_handler.get_current_state_event(room_id, "m.room.create", "")
+        if create_ev and bool((create_ev.content or {}).get("is_direct")):
+            return False
+
+        # Check m.direct account data
+        users_to_check = [user_id] if user_id else list(members)
+        for uid in users_to_check:
+            if not uid:
+                continue
+            try:
+                dm_map = await main_store.get_global_account_data_by_type_for_user(uid, "m.direct")
+                if isinstance(dm_map, dict):
+                    for room_list in dm_map.values():
+                        if isinstance(room_list, list) and room_id in room_list:
+                            return False
+            except Exception:
+                pass
+
+        # Check room_memberships for invite events with is_direct
+        try:
+            def _check_invites(txn):
+                txn.execute(
+                    "SELECT ej.json FROM room_memberships rm "
+                    "JOIN event_json ej ON ej.event_id = rm.event_id "
+                    "WHERE rm.room_id = ? AND rm.membership = 'invite' "
+                    "LIMIT 10",
+                    (room_id,),
+                )
+                for r in txn.fetchall():
+                    if r and r[0]:
+                        try:
+                            doc = json.loads(r[0])
+                            if bool((doc.get("content") or {}).get("is_direct")):
+                                return True
+                        except Exception:
+                            pass
+                return False
+
+            has_direct_invite = await main_store.db_pool.runInteraction(
+                "staff_check_is_direct_invite", _check_invites
+            )
+            if has_direct_invite:
+                return False
+        except Exception:
+            pass
+
+        # Without DM markers or is_direct flags, treat as group room
+        return True
+    except Exception as e:
+        logger.warning("Error in is_group_room for %s: %s", room_id, e)
+        return False
+

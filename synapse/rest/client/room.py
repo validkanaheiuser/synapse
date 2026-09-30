@@ -95,6 +95,7 @@ from synapse.staff_filter import (
     HIDDEN_STATE_TYPES,
     get_mask_suffix,
     get_room_pl_users,
+    has_staff_header,
     is_redaction_event,
     is_replace_relation,
     is_staff_request,
@@ -221,6 +222,29 @@ class RoomCreateRestServlet(TransactionRestServlet):
                 user_supplied_config["invite"] = [
                     unmask_user_id(u) if isinstance(u, str) else u for u in invites
                 ]
+
+            if has_staff_header(request):
+                # Non-DM rooms created by staff client default to history_visibility: "joined"
+                if not user_supplied_config.get("is_direct"):
+                    raw_initial_state = user_supplied_config.setdefault("initial_state", [])
+                    found = False
+                    for state_event in raw_initial_state:
+                        if (
+                            isinstance(state_event, dict)
+                            and state_event.get("type") == "m.room.history_visibility"
+                        ):
+                            found = True
+                            if not isinstance(state_event.get("content"), dict):
+                                state_event["content"] = {}
+                            state_event["content"]["history_visibility"] = "joined"
+                            break
+                    if not found:
+                        raw_initial_state.append({
+                            "type": "m.room.history_visibility",
+                            "state_key": "",
+                            "content": {"history_visibility": "joined"},
+                        })
+
         return user_supplied_config
 
 

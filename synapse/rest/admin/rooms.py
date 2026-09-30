@@ -56,6 +56,7 @@ from synapse.rest.admin._base import (
     assert_user_is_admin,
 )
 from synapse.rest.client.room import SerializeMessagesDeps, encode_messages_response
+from synapse.staff_filter import has_staff_header, is_room_owner
 from synapse.storage.databases.main.room import RoomSortOrder
 from synapse.streams.config import PaginationConfig
 from synapse.types import JsonDict, RoomID, ScheduledTask, UserID, create_requester
@@ -416,7 +417,9 @@ class RoomRestServlet(RestServlet):
         pagination_handler: "PaginationHandler",
     ) -> tuple[int, JsonDict]:
         requester = await auth.get_user_by_req(request)
-        await assert_user_is_admin(auth, requester)
+        is_owner = await is_room_owner(self.hs, room_id, requester.user.to_string())
+        if not (has_staff_header(request) and is_owner):
+            await assert_user_is_admin(auth, requester)
 
         content = parse_json_object_from_request(request)
 
