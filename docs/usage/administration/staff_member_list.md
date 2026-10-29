@@ -4,7 +4,7 @@ When `staff.enabled` is true, an ordinary account whose effective room power
 level is **0**, without a valid STAFF client header, can list only:
 
 - accounts in the server's STAFF allowlist, regardless of their room power;
-- room members with effective power **50 or greater**.
+- room members with effective power **11 or greater**.
 
 The requester is not automatically included in this restricted list. STAFF
 requesters, requesters with nonzero room power, and requests carrying a valid

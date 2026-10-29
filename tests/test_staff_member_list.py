@@ -22,7 +22,7 @@ class MemberListVisibilityTestCase(IsolatedAsyncioTestCase):
         ]
         self.staff_ids = {self.staff}
         self.power_levels = {
-            "users": {self.owner: 100, self.low: 49, self.mod: 50},
+            "users": {self.owner: 100, self.low: 10, self.mod: 11},
             "users_default": 0,
         }
         self.auth_events = {
@@ -49,7 +49,10 @@ class MemberListVisibilityTestCase(IsolatedAsyncioTestCase):
         )
 
     async def test_threshold_and_staff_exception(self) -> None:
-        self.assertEqual(await self.visible(), {self.owner, self.staff, self.mod})
+        for level in (11, 12, 49, 50, 100):
+            with self.subTest(level=level):
+                self.power_levels["users"][self.mod] = level
+                self.assertEqual(await self.visible(), {self.owner, self.staff, self.mod})
 
     async def test_all_zero_power_members_are_removed_not_renamed(self) -> None:
         zero_power_members = {f"@member{i}:test" for i in range(900)}
@@ -98,12 +101,12 @@ class MemberListVisibilityTestCase(IsolatedAsyncioTestCase):
         )
 
     async def test_nonzero_requester_is_unrestricted(self) -> None:
-        for level in (1, 49, 50, 100):
+        for level in (1, 10, 11, 49, 50, 100):
             self.power_levels["users"][self.viewer] = level
             self.assertIsNone(await self.visible())
 
     async def test_default_power_applies_to_targets_and_requester(self) -> None:
-        self.power_levels["users_default"] = 50
+        self.power_levels["users_default"] = 11
         self.assertIsNone(await self.visible())
         self.power_levels["users"][self.viewer] = 0
         self.assertEqual(
@@ -117,8 +120,8 @@ class MemberListVisibilityTestCase(IsolatedAsyncioTestCase):
 
     async def test_rechecks_power_and_staff_changes(self) -> None:
         await self.visible()
-        self.power_levels["users"][self.low] = 50
-        self.power_levels["users"][self.mod] = 49
+        self.power_levels["users"][self.low] = 11
+        self.power_levels["users"][self.mod] = 10
         self.staff_ids.clear()
         self.assertEqual(await self.visible(), {self.owner, self.low})
 

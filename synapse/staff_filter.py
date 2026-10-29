@@ -442,7 +442,7 @@ async def get_visible_member_ids(
     """Return the allowed member IDs, or None for an unrestricted requester.
 
     Only ordinary users with room power level 0 are restricted. Staff users
-    and members with power >= 50 remain visible, including invited members.
+    and members with power >= 11 remain visible, including invited members.
     STAFF clients identified by the staff header also receive the full list,
     even when the requester is not allowlisted and has room power 0. Callers
     must perform the normal authentication and room-access checks first.
@@ -478,7 +478,7 @@ async def get_visible_member_ids(
         user_id
         for user_id in member_ids
         if (staff_store is not None and staff_store.is_staff_user(user_id))
-        or get_user_power_level(user_id, auth_events) >= 50
+        or get_user_power_level(user_id, auth_events) >= 11
     )
 
 

@@ -25,7 +25,7 @@ class StaffMemberListTestCase(HomeserverTestCase):
         )
         self.users = {}
         self.tokens = {}
-        for name in ("viewer", "staff", "ordinary", "power49", "power50"):
+        for name in ("viewer", "staff", "ordinary", "power10", "power11"):
             user_id = self.register_user(name, "pass")
             token = self.login(name, "pass")
             self.users[name] = user_id
@@ -35,8 +35,8 @@ class StaffMemberListTestCase(HomeserverTestCase):
         self.power_levels = {
             "users": {
                 self.owner: 100,
-                self.users["power49"]: 49,
-                self.users["power50"]: 50,
+                self.users["power10"]: 10,
+                self.users["power11"]: 11,
             },
             "users_default": 0,
         }
@@ -71,8 +71,8 @@ class StaffMemberListTestCase(HomeserverTestCase):
         # Username masking is independent of member-list visibility.
         return {unmask_user_id(user_id) for user_id in ids}, body[MEMBER_LIST_RESTRICTED]
 
-    def test_zero_power_sees_only_staff_and_power_at_least_50(self):
-        expected = {self.owner, self.users["staff"], self.users["power50"]}
+    def test_zero_power_sees_only_staff_and_power_at_least_11(self):
+        expected = {self.owner, self.users["staff"], self.users["power11"]}
         for endpoint in ("members", "joined_members"):
             ids, restricted = self.members(endpoint=endpoint)
             self.assertEqual(ids, expected)
@@ -112,14 +112,14 @@ class StaffMemberListTestCase(HomeserverTestCase):
             self.assertFalse(restricted)
 
     def test_users_default_is_used_for_targets_and_requester(self):
-        self.power_levels["users_default"] = 50
+        self.power_levels["users_default"] = 11
         self.power_levels["users"][self.users["viewer"]] = 0
         self.set_power_levels()
         ids, restricted = self.members()
         self.assertTrue(restricted)
         self.assertEqual(
             ids,
-            {self.owner, self.users["staff"], self.users["ordinary"], self.users["power50"]},
+            {self.owner, self.users["staff"], self.users["ordinary"], self.users["power11"]},
         )
         del self.power_levels["users"][self.users["viewer"]]
         self.set_power_levels()
@@ -128,21 +128,21 @@ class StaffMemberListTestCase(HomeserverTestCase):
 
     def test_permission_changes_are_applied_on_the_next_request(self):
         self.members()
-        self.power_levels["users"][self.users["power49"]] = 50
-        self.power_levels["users"][self.users["power50"]] = 49
+        self.power_levels["users"][self.users["power10"]] = 11
+        self.power_levels["users"][self.users["power11"]] = 10
         self.set_power_levels()
         self.staff_ids.clear()
         for endpoint in ("members", "joined_members"):
             ids, restricted = self.members(endpoint=endpoint)
             self.assertTrue(restricted)
-            self.assertEqual(ids, {self.owner, self.users["power49"]})
+            self.assertEqual(ids, {self.owner, self.users["power10"]})
 
     def test_membership_query_still_filters_eligible_members(self):
         ids, restricted = self.members(query="?membership=invite")
         self.assertTrue(restricted)
         self.assertEqual(ids, set())
         ids, _ = self.members(query="?membership=join")
-        self.assertEqual(ids, {self.owner, self.users["staff"], self.users["power50"]})
+        self.assertEqual(ids, {self.owner, self.users["staff"], self.users["power11"]})
 
     def test_disabled_staff_module_preserves_full_list(self):
         self.hs.config.staff.staff_enabled = False
