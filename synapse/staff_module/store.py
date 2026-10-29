@@ -848,6 +848,29 @@ class StaffStore:
             desc="staff_widget_instance_event",
         )
 
+    async def widget_instances_in_room(
+        self, room_id: str
+    ) -> List[Dict[str, Any]]:
+        """All tracked widget instances living in `room_id` (used by the
+        /widgets/resync prune step; only tracked instances are ever
+        removed so user-added widgets such as Jitsi are never touched)."""
+        rows = await self._db_pool.simple_select_list(
+            table="staff_widget_room_instances",
+            keyvalues={"room_id": room_id},
+            retcols=self._INSTANCE_COLS,
+            desc="staff_widget_instances_in_room",
+        )
+        return [dict(zip(self._INSTANCE_COLS, r)) for r in rows]
+
+    async def widget_instance_delete(
+        self, widget_id: str, room_id: str
+    ) -> int:
+        return await self._db_pool.simple_delete(
+            table="staff_widget_room_instances",
+            keyvalues={"widget_id": widget_id, "room_id": room_id},
+            desc="staff_widget_instance_delete",
+        )
+
     # -------------------------------------------- account_data idempotency
 
     async def has_pushed_account_data(self, user_id: str) -> bool:

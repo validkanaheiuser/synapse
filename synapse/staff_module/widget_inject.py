@@ -14,7 +14,7 @@
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set
 
 from .forge import send_event_as
 from .widget_payload import build_widget_state_content
@@ -273,6 +273,39 @@ class WidgetInjector:
                     pass
         return False
 
+    async def desired_widgets_for_staff(
+        self, staff_user: str
+    ) -> "Dict[str, Any]":
+        """Return {widget_id: widget_row} that `staff_user` should have in
+        each of their 2-person DMs.
+
+        Group-scoped: if the staff belongs to a group, only that group's
+        general_widgets; otherwise every general_widget.  Plus the staff's
+        own staff_custom_widgets.  Shared by F16 auto-injection and the
+        /widgets/resync backfill so both agree on the desired set.
+        """
+        widgets_dict: Dict[str, Any] = {}
+        user_groups = await self._store.groups_for_user(staff_user)
+        if user_groups:
+            widget_ids_via_groups = (
+                await self._store.widget_ids_for_user_via_groups(staff_user)
+            )
+            for wid in widget_ids_via_groups:
+                w = await self._store.widget_get(wid)
+                if w is not None:
+                    widgets_dict[wid] = w
+        else:
+            all_general = await self._store.widget_list(widget_type="general_widget")
+            for w in all_general:
+                widgets_dict[w["widget_id"]] = w
+
+        custom = await self._store.widget_list(
+            widget_type="staff_custom_widget", owner_user_id=staff_user,
+        )
+        for w in custom:
+            widgets_dict[w["widget_id"]] = w
+        return widgets_dict
+
     async def _inject_widgets_for_staff(
         self, room_id: str, staff_user: str
     ) -> None:
@@ -289,28 +322,7 @@ class WidgetInjector:
             # Group-scoped widgets: Nếu staff đã được xếp vào group, chỉ inject các widget
             # thuộc group của staff đó. Nếu staff chưa được xếp vào group nào thì fallback
             # inject toàn bộ general_widgets.
-            user_groups = await self._store.groups_for_user(staff_user)
-            widgets_dict: Dict[str, Any] = {}
-            if user_groups:
-                widget_ids_via_groups = (
-                    await self._store.widget_ids_for_user_via_groups(staff_user)
-                )
-                for wid in widget_ids_via_groups:
-                    w = await self._store.widget_get(wid)
-                    if w is not None:
-                        widgets_dict[wid] = w
-            else:
-                all_general = await self._store.widget_list(widget_type="general_widget")
-                for w in all_general:
-                    widgets_dict[w["widget_id"]] = w
-
-            # 2. Custom widget riêng của staff này (ví dụ: widget "Đăng ký"):
-            custom = await self._store.widget_list(
-                widget_type="staff_custom_widget", owner_user_id=staff_user,
-            )
-            for w in custom:
-                widgets_dict[w["widget_id"]] = w
-
+            widgets_dict = await self.desired_widgets_for_staff(staff_user)
             widgets = list(widgets_dict.values())
             # === END AGENT P ===
 

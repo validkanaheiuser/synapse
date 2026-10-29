@@ -228,6 +228,9 @@ class StaffModule:
         from .auto_reply import AutoReplyManager
 
         self._widget_injector = WidgetInjector(self._hs, self._store)
+        # Exposed so rest_widget_resync can reuse the DM detection + desired-set
+        # logic from the REST path (main process) without a second instance.
+        setattr(self._hs, "_staff_widget_injector", self._widget_injector)
         self._auto_reply_manager = AutoReplyManager(self._hs, self._store)
         setattr(self._hs, "_staff_auto_reply_mgr", self._auto_reply_manager)
 
@@ -336,6 +339,7 @@ class StaffModule:
         # === AGENT P ===
         from . import rest_widget_groups  # /groups CRUD
         # === END AGENT P ===
+        from . import rest_widget_resync  # POST /widgets/resync backfill
 
         for mod in (
             rest_staff_admin,
@@ -344,6 +348,10 @@ class StaffModule:
             rest_messages,
             rest_edit,
             rest_schedule,
+            # /widgets/resync must be registered BEFORE rest_widgets: JsonResource
+            # matches in registration order and rest_widgets owns the greedy
+            # GET "/widgets/(?P<widget_id>[^/]+)" pattern.
+            rest_widget_resync,
             rest_widgets,
             rest_autoreply,
             rest_dm_names,
