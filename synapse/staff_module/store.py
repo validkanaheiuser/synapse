@@ -40,10 +40,36 @@ class StaffStore:
         self._stealth_redaction_event_ids: Set[str] = set()
         self._staff_edit_event_ids: Set[str] = set()
         # Populated lazily by `prime_staff_cache` during module init.
+        # Set once `ensure_schema` has run (or decided not to) in this process.
+        self._schema_ensured = False
 
-    # ------------------------------------------------------------------ users
+    # ------------------------------------------------------------------ schema
 
-    async def prime_staff_cache(self) -> None:
+    def _runs_schema_ddl(self) -> bool:
+        """Only the single process that runs Synapse's background tasks
+        (main, or the `run_background_tasks_on` worker) issues DDL.  Every
+        other worker only reads the staff tables, which the schema deltas
+        (95/*.sql) already created.  Defaults to True when there is no
+        worker config (single-process / test harnesses)."""
+        worker = getattr(getattr(self._hs, "config", None), "worker", None)
+        return bool(getattr(worker, "run_background_tasks", True))
+
+    async def ensure_schema(self) -> None:
+        """Idempotent upgrade DDL for databases created before the staff
+        deltas gained these tables/indexes.
+
+        Runs at most ONCE per process and only on the background-tasks
+        process.  Until 2026-10-30 this DDL ran inside every
+        `prime_staff_cache()` call, i.e. every `refresh_interval_sec` on
+        all workers, dropping and re-creating the staff_widget_group_*
+        unique indexes each minute (1.2M DDL statements in a month, 597
+        Postgres deadlocks on 2026-10-28)."""
+        if self._schema_ensured:
+            return
+        self._schema_ensured = True
+        if not self._runs_schema_ddl():
+            return
+
         def _ensure_dm_names_table(txn):
             txn.execute(
                 "CREATE TABLE IF NOT EXISTS staff_dm_names ("
@@ -158,6 +184,16 @@ class StaffStore:
             await self._db_pool.runInteraction("staff_ensure_group_single_membership", _ensure_group_single_membership)
         except Exception:
             logger.exception("STAFF: error ensuring group single membership constraints")
+
+    # ------------------------------------------------------------------ users
+
+    async def prime_staff_cache(self) -> None:
+        """(Re)load the in-memory staff allowlist and edit caches.  Called at
+        module init, from the periodic reloader (`refresh_interval_sec`) and
+        from replication cache invalidations, so it must stay cheap: the
+        schema DDL is delegated to `ensure_schema`, which no-ops after its
+        first call."""
+        await self.ensure_schema()
 
         rows = await self._db_pool.simple_select_list(
             table="staff_users",

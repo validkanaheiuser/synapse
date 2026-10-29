@@ -31,7 +31,8 @@ from synapse.types import JsonDict
 from tests.unittest import HomeserverTestCase
 
 
-STAFF_SECRET = "test-staff-secret-deadbeef"
+# synapse.config.staff rejects secrets shorter than 32 chars; keep it 64 hex.
+STAFF_SECRET = "746573742d73746166662d7365637265742d6465616462656566746573743031"
 STAFF_HEADER_NAME = b"X-STAFF-Client"
 STAFF_HEADER_VALUE = b"1"
 STAFF_SECRET_HEADER = b"X-Staff-Secret"
