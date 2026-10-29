@@ -17,17 +17,17 @@ its own rows.
    caller is identified by a Matrix access token or only by the `user_id`
    parameter.
 2. **Any account on the STAFF client**: a request carrying the
-   `X-STAFF-Client: 1` header is allowed for non-staff accounts too, **provided
-   the caller is proven by a valid Matrix access token** in the `Authorization:
-   Bearer` header. The user id from the token is always used; a differing
-   `user_id` parameter is ignored (and logged), so the header cannot be used to
-   reach another account's nicknames.
-3. Everything else is `403 M_FORBIDDEN`. In particular a non-staff request
-   with the header but without a valid Matrix access token (for example a
-   legacy staff JWT, or only a `user_id` parameter) is refused.
+   `X-STAFF-Client: 1` header is allowed for non-staff accounts too. When a
+   valid Matrix access token is presented in `Authorization: Bearer`, the user
+   id from the token is used and a differing `user_id` parameter is ignored
+   (and logged). Without a usable token the `user_id` parameter is trusted,
+   exactly as on the legacy staff path.
+3. Everything else is `403 M_FORBIDDEN`.
 
-The header is client-controlled: any client that sends it gets rule 2. The
-guarantee is therefore "own data only", not "staff only". The same header
-already lifts the member-list restriction (see `staff_member_list.md`).
+Trust model (operator decision, 2026-10-29): the header is client-controlled
+and the parameter is unverified, so anyone who sends the header can read or
+change the nicknames stored under any `user_id`. The data is only display
+nicknames. The same header already lifts the member-list restriction (see
+`staff_member_list.md`).
 
 Tests: `tests/test_staff_dm_names.py`.

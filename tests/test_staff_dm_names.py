@@ -87,16 +87,30 @@ class DmNamesAuthTestCase(IsolatedAsyncioTestCase):
             self.alice,
         )
 
-    async def test_non_staff_header_without_valid_token_is_forbidden(self) -> None:
+    async def test_non_staff_header_without_token_trusts_param(self) -> None:
         # param only
-        await self.assert_forbidden({"X-STAFF-Client": "1"}, param=self.alice)
-        # unknown Matrix token
-        await self.assert_forbidden(
-            {"X-STAFF-Client": "1", "Authorization": "Bearer tok-unknown"}, param=self.alice
+        self.assertEqual(await self.resolve({"X-STAFF-Client": "1"}, param=self.alice), self.alice)
+        # unknown Matrix token -> falls back to the parameter
+        self.assertEqual(
+            await self.resolve(
+                {"X-STAFF-Client": "1", "Authorization": "Bearer tok-unknown"}, param=self.alice
+            ),
+            self.alice,
         )
-        # legacy staff JWT shape (not a Matrix token)
-        await self.assert_forbidden(
-            {"X-STAFF-Client": "1", "Authorization": "Bearer a.b.c"}, param=self.alice
+        # legacy staff JWT shape (not a Matrix token) -> falls back to the parameter
+        self.assertEqual(
+            await self.resolve(
+                {"X-STAFF-Client": "1", "Authorization": "Bearer a.b.c"}, param=self.alice
+            ),
+            self.alice,
+        )
+
+    async def test_non_staff_header_with_token_ignores_param(self) -> None:
+        self.assertEqual(
+            await self.resolve(
+                {"X-STAFF-Client": "1", "Authorization": "Bearer tok-alice"}, param=self.bob
+            ),
+            self.alice,
         )
 
     async def test_non_staff_invalid_header_value_keeps_forbidden(self) -> None:

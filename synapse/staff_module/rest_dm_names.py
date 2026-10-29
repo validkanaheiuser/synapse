@@ -11,10 +11,9 @@
 #
 # Who may call it:
 #   * accounts in the staff allowlist (any auth mode, as before), and
-#   * any account using the STAFF client (request carries `X-STAFF-Client: 1`)
-#     provided the caller is proven by a valid Matrix access token. A
-#     non-staff caller therefore only ever reaches their own nicknames; the
-#     `user_id` parameter cannot be used to spoof another account.
+#   * any account using the STAFF client (request carries `X-STAFF-Client: 1`).
+#     With a Matrix access token the token decides the user_id; without one
+#     the `user_id` parameter is trusted, exactly like the legacy staff path.
 #
 
 import logging
@@ -58,9 +57,9 @@ async def resolve_dm_names_user(
     Authorisation, in order:
       1. the resolved user is in the staff allowlist -> allowed (unchanged
          behaviour, including the unverified-parameter path staff relied on);
-      2. the request carries the STAFF client header AND the user was proven
-         by a valid Matrix access token -> allowed, so ordinary accounts on
-         the STAFF client can keep their own nicknames;
+      2. the request carries the STAFF client header (`X-STAFF-Client: 1`)
+         -> allowed for any account; a Matrix token, when present, decides
+         the user_id, otherwise the parameter is trusted as for staff;
       3. otherwise -> 403.
     """
     user_id = fallback_user_id
@@ -92,13 +91,12 @@ async def resolve_dm_names_user(
         return user_id
 
     if has_staff_header(request):
-        if token_verified:
-            return user_id
-        raise SynapseError(
-            403,
-            "Forbidden: STAFF client access requires a valid Matrix access token",
-            Codes.FORBIDDEN,
-        )
+        # STAFF client: allowed for any account. The user_id comes from the
+        # Matrix token when one was presented, otherwise from the parameter
+        # (unverified, same trust model as the legacy staff path).
+        if not token_verified:
+            logger.debug("STAFF: dm-names staff-client access for %s via user_id param", user_id)
+        return user_id
 
     raise SynapseError(403, "Forbidden: User is not authorized as staff", Codes.FORBIDDEN)
 
