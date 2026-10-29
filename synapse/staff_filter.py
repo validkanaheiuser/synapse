@@ -428,6 +428,51 @@ async def get_room_pl_users(hs: "HomeServer", room_id: str) -> dict:
     return {}
 
 
+MEMBER_LIST_RESTRICTED = "io.element.staff.member_list_restricted"
+
+
+async def get_visible_member_ids(
+    hs: "HomeServer", room_id: str, requester_user: str, member_ids: Iterable[str]
+) -> Optional[FrozenSet[str]]:
+    """Return the allowed member IDs, or None for an unrestricted requester.
+
+    Only ordinary users with room power level 0 are restricted. Staff users
+    and members with power >= 50 remain visible, including invited members.
+    This is an account permission check: a client-supplied staff header must
+    not grant access to the full list. Current permissions also govern
+    historical /members requests.
+    """
+    from synapse.api.constants import EventTypes
+    from synapse.event_auth import get_user_power_level
+    from synapse.types.state import StateFilter
+
+    if not hs.config.staff.staff_enabled:
+        return None
+
+    staff_store = getattr(hs, "_staff_store", None)
+    if staff_store is not None and staff_store.is_staff_user(requester_user):
+        return None
+
+    auth_events = await hs.get_storage_controllers().state.get_current_state(
+        room_id,
+        StateFilter.from_types(
+            [(EventTypes.Create, ""), (EventTypes.PowerLevels, "")]
+        ),
+    )
+    # Use Matrix's own power calculation, including users_default and the
+    # implicit power of room creators. Do not fall back to an unfiltered list
+    # if the state lookup fails.
+    if get_user_power_level(requester_user, auth_events) != 0:
+        return None
+
+    return frozenset(
+        user_id
+        for user_id in member_ids
+        if (staff_store is not None and staff_store.is_staff_user(user_id))
+        or get_user_power_level(user_id, auth_events) >= 50
+    )
+
+
 async def is_room_owner(hs: "HomeServer", room_id: str, user_id: str) -> bool:
     """Check if user_id is the room owner / trưởng nhóm.
     A user is the room owner if:

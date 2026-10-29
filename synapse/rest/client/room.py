@@ -93,8 +93,10 @@ if TYPE_CHECKING:
 # === STAFF-MOD BEGIN ===
 from synapse.staff_filter import (
     HIDDEN_STATE_TYPES,
+    MEMBER_LIST_RESTRICTED,
     get_mask_suffix,
     get_room_pl_users,
+    get_visible_member_ids,
     has_staff_header,
     is_redaction_event,
     is_replace_relation,
@@ -889,7 +891,14 @@ class RoomMemberListRestServlet(RestServlet):
                 continue
             chunk.append(event)
 
-        # === STAFF-MOD BEGIN: mask member list usernames for non-staff ===
+        # === STAFF-MOD BEGIN: restrict the list before masking identifiers ===
+        visible_ids = await get_visible_member_ids(
+            self._hs, room_id, requester.user.to_string(),
+            (event["state_key"] for event in chunk),
+        )
+        if visible_ids is not None:
+            chunk = [event for event in chunk if event["state_key"] in visible_ids]
+
         is_staff = has_staff_header(request)  # staff-client view = real names + full truth (see AskUser 2026-09-30)
         if not is_staff:
             try:
@@ -908,7 +917,10 @@ class RoomMemberListRestServlet(RestServlet):
                 mask_event_dict_for_non_staff(m, self_mxid, is_staff, staff_store, pl_users)
         # === STAFF-MOD END ===
 
-        return 200, {"chunk": chunk}
+        return 200, {
+            "chunk": chunk,
+            MEMBER_LIST_RESTRICTED: visible_ids is not None,
+        }
 
 
 # deprecated in favour of /members?membership=join?
@@ -932,6 +944,16 @@ class JoinedRoomMemberListRestServlet(RestServlet):
             requester, room_id
         )
 
+        visible_ids = await get_visible_member_ids(
+            self._hs, room_id, requester.user.to_string(), users_with_profile
+        )
+        if visible_ids is not None:
+            users_with_profile = {
+                user_id: profile
+                for user_id, profile in users_with_profile.items()
+                if user_id in visible_ids
+            }
+
         is_staff = has_staff_header(request)  # staff-client view = real names + full truth (see AskUser 2026-09-30)
         if not is_staff and isinstance(users_with_profile, dict):
             staff_store = getattr(self._hs, "_staff_store", None)
@@ -951,7 +973,10 @@ class JoinedRoomMemberListRestServlet(RestServlet):
                 masked_profiles[masked_uid] = prof
             users_with_profile = masked_profiles
 
-        return 200, {"joined": users_with_profile}
+        return 200, {
+            "joined": users_with_profile,
+            MEMBER_LIST_RESTRICTED: visible_ids is not None,
+        }
 
 
 @attr.s(slots=True, frozen=True, auto_attribs=True)
