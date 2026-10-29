@@ -19,6 +19,10 @@ apply the policy after the existing room-access checks and before username
 masking. Membership query filters still apply. Current permissions are used
 even when `/members` requests historical state with `at`.
 
+Username masking for non-staff viewers uses the same threshold: members with
+room power level 11 or greater keep their real username, members below 11 are
+masked (`MASK_POWER_THRESHOLD` in `synapse/staff_filter.py`).
+
 Responses include `io.element.staff.member_list_restricted`, a boolean that
 lets the patched Element Web member-list store distinguish a restricted result
 from an ordinary full response. The web client builds restricted rows from

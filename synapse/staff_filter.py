@@ -209,6 +209,10 @@ def is_redaction_event(event_type: str) -> bool:
 
 
 _MASK_SALT = "elm_random_user_salt_v1"
+# Members at or above this room power level keep their real username for
+# non-staff viewers; below it the localpart is masked. Kept equal to the
+# member-list visibility threshold in get_visible_member_ids.
+MASK_POWER_THRESHOLD = 11
 
 
 def get_mask_suffix(localpart: str) -> str:
@@ -259,7 +263,8 @@ def should_mask_user(
     1. If requester is staff (is_staff == True), NEVER mask (staff sees real usernames).
     2. If target_user is the requester themselves, do NOT mask (user sees own real username).
     3. If target_user is a staff member, do NOT mask (staff members show real username).
-    4. If in a room/group and target_user has power custom = 50 (or >= 50), do NOT mask.
+    4. If in a room/group and target_user has power level >= 11, do NOT mask
+       (same threshold as member-list visibility; members below 11 are masked).
     5. Otherwise, mask (add 4 random characters to localpart).
     """
     if is_staff:
@@ -278,7 +283,7 @@ def should_mask_user(
         pl = room_pl_users.get(target_user)
         if pl is not None:
             try:
-                if int(pl) >= 50:
+                if int(pl) >= MASK_POWER_THRESHOLD:
                     return False
             except (ValueError, TypeError):
                 pass
