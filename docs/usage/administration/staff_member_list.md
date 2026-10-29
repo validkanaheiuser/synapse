@@ -1,15 +1,18 @@
 # STAFF member-list visibility
 
 When `staff.enabled` is true, an ordinary account whose effective room power
-level is **0** can list only:
+level is **0**, without a valid STAFF client header, can list only:
 
 - accounts in the server's STAFF allowlist, regardless of their room power;
 - room members with effective power **50 or greater**.
 
 The requester is not automatically included in this restricted list. STAFF
-requesters and requesters with nonzero room power retain the full list.
+requesters, requesters with nonzero room power, and requests carrying a valid
+`X-STAFF-Client: 1` header retain the full list. The header exception also
+applies to ordinary, non-allowlisted accounts with power 0.
 Power calculation uses Matrix's normal rules, including `users_default` and
-implicit creator privileges. `X-STAFF-Client` alone does not bypass this policy.
+implicit creator privileges. Header-tagged requests still require normal
+authentication and permission to access the room.
 
 Both `GET /rooms/{roomId}/members` and `GET /rooms/{roomId}/joined_members`
 apply the policy after the existing room-access checks and before username

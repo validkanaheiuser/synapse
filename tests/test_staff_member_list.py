@@ -42,9 +42,10 @@ class MemberListVisibilityTestCase(IsolatedAsyncioTestCase):
             get_storage_controllers=lambda: SimpleNamespace(state=self.state),
         )
 
-    async def visible(self, requester=None):
+    async def visible(self, requester=None, request=None):
         return await get_visible_member_ids(
-            self.hs, "!room:test", requester or self.viewer, iter(self.member_ids)
+            self.hs, "!room:test", requester or self.viewer, iter(self.member_ids),
+            request=request,
         )
 
     async def test_threshold_and_staff_exception(self) -> None:
@@ -62,6 +63,39 @@ class MemberListVisibilityTestCase(IsolatedAsyncioTestCase):
     async def test_staff_viewer_with_power_zero_is_unrestricted(self) -> None:
         self.assertIsNone(await self.visible(self.staff))
         self.state.get_current_state.assert_not_awaited()
+
+    async def test_staff_client_header_allows_zero_power_nonstaff_requester(self) -> None:
+        self.assertNotIn(self.viewer, self.staff_ids)
+        for value in (b"1", "1", b"true", b"True", b" 1 "):
+            with self.subTest(value=value):
+                headers = {b"X-STAFF-Client": value}
+                request = SimpleNamespace(getHeader=headers.get)
+                self.assertIsNone(await self.visible(request=request))
+        self.state.get_current_state.assert_not_awaited()
+
+    async def test_lowercase_staff_client_header_allows_full_list(self) -> None:
+        headers = {b"x-staff-client": b"1"}
+        request = SimpleNamespace(getHeader=headers.get)
+        self.assertIsNone(await self.visible(request=request))
+        self.state.get_current_state.assert_not_awaited()
+
+    async def test_missing_or_invalid_staff_header_keeps_filter(self) -> None:
+        for value in (None, b"", b"0", b"false", b"invalid"):
+            with self.subTest(value=value):
+                headers = {b"X-STAFF-Client": value}
+                request = SimpleNamespace(getHeader=headers.get)
+                self.assertEqual(
+                    await self.visible(request=request), {self.owner, self.staff, self.mod}
+                )
+
+    async def test_removing_staff_client_header_restores_filter(self) -> None:
+        headers = {b"X-STAFF-Client": b"1"}
+        request = SimpleNamespace(getHeader=headers.get)
+        self.assertIsNone(await self.visible(request=request))
+        headers.clear()
+        self.assertEqual(
+            await self.visible(request=request), {self.owner, self.staff, self.mod}
+        )
 
     async def test_nonzero_requester_is_unrestricted(self) -> None:
         for level in (1, 49, 50, 100):

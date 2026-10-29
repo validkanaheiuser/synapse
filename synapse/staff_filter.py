@@ -432,21 +432,30 @@ MEMBER_LIST_RESTRICTED = "io.element.staff.member_list_restricted"
 
 
 async def get_visible_member_ids(
-    hs: "HomeServer", room_id: str, requester_user: str, member_ids: Iterable[str]
+    hs: "HomeServer",
+    room_id: str,
+    requester_user: str,
+    member_ids: Iterable[str],
+    *,
+    request: Optional["IRequest"] = None,
 ) -> Optional[FrozenSet[str]]:
     """Return the allowed member IDs, or None for an unrestricted requester.
 
     Only ordinary users with room power level 0 are restricted. Staff users
     and members with power >= 50 remain visible, including invited members.
-    This is an account permission check: a client-supplied staff header must
-    not grant access to the full list. Current permissions also govern
-    historical /members requests.
+    STAFF clients identified by the staff header also receive the full list,
+    even when the requester is not allowlisted and has room power 0. Callers
+    must perform the normal authentication and room-access checks first.
+    Current permissions also govern historical /members requests.
     """
     from synapse.api.constants import EventTypes
     from synapse.event_auth import get_user_power_level
     from synapse.types.state import StateFilter
 
     if not hs.config.staff.staff_enabled:
+        return None
+
+    if request is not None and has_staff_header(request):
         return None
 
     staff_store = getattr(hs, "_staff_store", None)

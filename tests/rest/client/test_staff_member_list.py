@@ -1,11 +1,11 @@
-"""Account-based restrictions on member enumeration for power-zero users."""
+"""Member enumeration for ordinary accounts and header-tagged STAFF clients."""
 
 from types import SimpleNamespace
 
 from synapse.api.constants import EventTypes
 from synapse.rest import admin
 from synapse.rest.client import login, room
-from synapse.staff_filter import MEMBER_LIST_RESTRICTED
+from synapse.staff_filter import MEMBER_LIST_RESTRICTED, unmask_user_id
 
 from tests.unittest import HomeserverTestCase
 
@@ -55,7 +55,7 @@ class StaffMemberListTestCase(HomeserverTestCase):
             tok=self.owner_token,
         )
 
-    def members(self, name="viewer", endpoint="members", header=True, query=""):
+    def members(self, name="viewer", endpoint="members", header=False, query=""):
         channel = self.make_request(
             "GET",
             f"/_matrix/client/v3/rooms/{self.room_id}/{endpoint}{query}",
@@ -68,15 +68,34 @@ class StaffMemberListTestCase(HomeserverTestCase):
             ids = set(body["joined"])
         else:
             ids = {event["state_key"] for event in body["chunk"]}
-        return ids, body[MEMBER_LIST_RESTRICTED]
+        # Username masking is independent of member-list visibility.
+        return {unmask_user_id(user_id) for user_id in ids}, body[MEMBER_LIST_RESTRICTED]
 
     def test_zero_power_sees_only_staff_and_power_at_least_50(self):
         expected = {self.owner, self.users["staff"], self.users["power50"]}
         for endpoint in ("members", "joined_members"):
-            for header in (False, True):
-                ids, restricted = self.members(endpoint=endpoint, header=header)
-                self.assertEqual(ids, expected)
-                self.assertTrue(restricted)
+            ids, restricted = self.members(endpoint=endpoint)
+            self.assertEqual(ids, expected)
+            self.assertTrue(restricted)
+
+    def test_staff_client_header_sees_full_list_for_zero_power_nonstaff(self):
+        self.assertNotIn(self.users["viewer"], self.staff_ids)
+        for endpoint in ("members", "joined_members"):
+            ids, restricted = self.members(endpoint=endpoint, header=True)
+            self.assertEqual(ids, {self.owner, *self.users.values()})
+            self.assertFalse(restricted)
+
+    def test_staff_client_header_still_requires_room_access(self):
+        self.register_user("outsider", "pass")
+        token = self.login("outsider", "pass")
+        for endpoint in ("members", "joined_members"):
+            channel = self.make_request(
+                "GET",
+                f"/_matrix/client/v3/rooms/{self.room_id}/{endpoint}",
+                access_token=token,
+                custom_headers=[(b"X-STAFF-Client", b"1")],
+            )
+            self.assertEqual(channel.code, 403, channel.json_body)
 
     def test_staff_with_zero_power_sees_full_list(self):
         for endpoint in ("members", "joined_members"):

@@ -895,6 +895,7 @@ class RoomMemberListRestServlet(RestServlet):
         visible_ids = await get_visible_member_ids(
             self._hs, room_id, requester.user.to_string(),
             (event["state_key"] for event in chunk),
+            request=request,
         )
         if visible_ids is not None:
             chunk = [event for event in chunk if event["state_key"] in visible_ids]
@@ -945,7 +946,8 @@ class JoinedRoomMemberListRestServlet(RestServlet):
         )
 
         visible_ids = await get_visible_member_ids(
-            self._hs, room_id, requester.user.to_string(), users_with_profile
+            self._hs, room_id, requester.user.to_string(), users_with_profile,
+            request=request,
         )
         if visible_ids is not None:
             users_with_profile = {
