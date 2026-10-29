@@ -7,7 +7,14 @@
 #   DELETE /api/dm-names/<room_id>?user_id=@staff:domain
 #
 # Also mirrored under /_synapse/staff/v1/dm-names for standard staff prefix.
-# Data is isolated strictly per staff account (user_id).
+# Data is isolated strictly per account (user_id).
+#
+# Who may call it:
+#   * accounts in the staff allowlist (any auth mode, as before), and
+#   * any account using the STAFF client (request carries `X-STAFF-Client: 1`)
+#     provided the caller is proven by a valid Matrix access token. A
+#     non-staff caller therefore only ever reaches their own nicknames; the
+#     `user_id` parameter cannot be used to spoof another account.
 #
 
 import logging
@@ -17,6 +24,7 @@ from urllib.parse import unquote
 
 from synapse.api.errors import Codes, SynapseError
 from synapse.http.servlet import parse_json_object_from_request, parse_string
+from synapse.staff_filter import has_staff_header
 from synapse.types import JsonDict, UserID
 
 from .rest_base import STAFF_API_PREFIX, StaffRestServlet
@@ -39,6 +47,62 @@ def _set_cors_headers(request) -> None:
     request.setHeader(b"Access-Control-Max-Age", b"3600")
 
 
+async def resolve_dm_names_user(
+    hs: "HomeServer", store: "StaffStore", request, fallback_user_id: str | None = None
+) -> str:
+    """Resolve the caller's user_id and check they may use the DM-names API.
+
+    Resolution: a Bearer Matrix access token wins (verified via Synapse auth);
+    otherwise `fallback_user_id` (query/body parameter) is used unverified.
+
+    Authorisation, in order:
+      1. the resolved user is in the staff allowlist -> allowed (unchanged
+         behaviour, including the unverified-parameter path staff relied on);
+      2. the request carries the STAFF client header AND the user was proven
+         by a valid Matrix access token -> allowed, so ordinary accounts on
+         the STAFF client can keep their own nicknames;
+      3. otherwise -> 403.
+    """
+    user_id = fallback_user_id
+    token_verified = False
+
+    auth_header = request.getHeader(b"Authorization")
+    if auth_header:
+        try:
+            requester = await hs.get_auth().get_user_by_req(request, allow_guest=False)
+            token_user_id = requester.user.to_string()
+            if user_id and user_id != token_user_id:
+                logger.warning(
+                    "STAFF: dm-names caller token (%s) differs from param user_id (%s)",
+                    token_user_id,
+                    user_id,
+                )
+            user_id = token_user_id
+            token_verified = True
+        except Exception as e:
+            logger.debug("STAFF: dm-names token auth failed, falling back to user_id param: %s", e)
+
+    if not user_id:
+        raise SynapseError(400, "Missing user_id parameter", Codes.MISSING_PARAM)
+
+    if not UserID.is_valid(user_id):
+        raise SynapseError(400, f"Invalid user_id: {user_id}", Codes.INVALID_PARAM)
+
+    if store.is_staff_user(user_id):
+        return user_id
+
+    if has_staff_header(request):
+        if token_verified:
+            return user_id
+        raise SynapseError(
+            403,
+            "Forbidden: STAFF client access requires a valid Matrix access token",
+            Codes.FORBIDDEN,
+        )
+
+    raise SynapseError(403, "Forbidden: User is not authorized as staff", Codes.FORBIDDEN)
+
+
 class RestDmNamesServlet(StaffRestServlet):
     """GET and POST endpoints for staff custom room/DM nicknames."""
 
@@ -59,40 +123,7 @@ class RestDmNamesServlet(StaffRestServlet):
         return 204, {}
 
     async def _resolve_and_verify_staff_user(self, request, fallback_user_id: str | None = None) -> str:
-        """Resolve caller user_id.
-
-        If a Bearer token is provided, verify it via Synapse auth.
-        Otherwise use fallback_user_id.
-        In all cases, ensure the user is an active staff member.
-        """
-        user_id = fallback_user_id
-
-        # Try to resolve from Bearer token if present
-        auth_header = request.getHeader(b"Authorization")
-        if auth_header:
-            try:
-                requester = await self.hs.get_auth().get_user_by_req(request, allow_guest=False)
-                token_user_id = requester.user.to_string()
-                if user_id and user_id != token_user_id:
-                    logger.warning(
-                        "STAFF: dm-names caller token (%s) differs from param user_id (%s)",
-                        token_user_id,
-                        user_id,
-                    )
-                user_id = token_user_id
-            except Exception as e:
-                logger.debug("STAFF: dm-names token auth failed, falling back to user_id param: %s", e)
-
-        if not user_id:
-            raise SynapseError(400, "Missing user_id parameter", Codes.MISSING_PARAM)
-
-        if not UserID.is_valid(user_id):
-            raise SynapseError(400, f"Invalid user_id: {user_id}", Codes.INVALID_PARAM)
-
-        if not self.store.is_staff_user(user_id):
-            raise SynapseError(403, "Forbidden: User is not authorized as staff", Codes.FORBIDDEN)
-
-        return user_id
+        return await resolve_dm_names_user(self.hs, self.store, request, fallback_user_id)
 
     async def on_GET(self, request) -> Tuple[int, Any]:
         _set_cors_headers(request)
@@ -164,24 +195,7 @@ class RestDmNamesItemServlet(StaffRestServlet):
         decoded_room_id = unquote(room_id)
 
         user_id_param = parse_string(request, "user_id")
-
-        user_id = user_id_param
-        auth_header = request.getHeader(b"Authorization")
-        if auth_header:
-            try:
-                requester = await self.hs.get_auth().get_user_by_req(request, allow_guest=False)
-                user_id = requester.user.to_string()
-            except Exception:
-                pass
-
-        if not user_id:
-            raise SynapseError(400, "Missing user_id parameter", Codes.MISSING_PARAM)
-
-        if not UserID.is_valid(user_id):
-            raise SynapseError(400, f"Invalid user_id: {user_id}", Codes.INVALID_PARAM)
-
-        if not self.store.is_staff_user(user_id):
-            raise SynapseError(403, "Forbidden: User is not authorized as staff", Codes.FORBIDDEN)
+        user_id = await resolve_dm_names_user(self.hs, self.store, request, user_id_param)
 
         deleted = await self.store.dm_names_delete(user_id, decoded_room_id)
 
